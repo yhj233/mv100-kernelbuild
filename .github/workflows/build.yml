@@ -1,0 +1,63 @@
+name: build mv100 kernel
+
+# Builds a Hi3798MV100 (Huawei EC6108V9C) uImage from the histb-mainline tree.
+# The kernel source is cloned inside the runner, so this repository only needs
+# to carry build.sh + this workflow file.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - 'build.sh'
+      - '.github/workflows/build.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout (this repo)
+        uses: actions/checkout@v4
+
+      - name: Install cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libncurses-dev \
+            kmod cpio rsync u-boot-tools device-tree-compiler \
+            gcc-arm-linux-gnueabihf
+          arm-linux-gnueabihf-gcc --version | head -1
+
+      - name: Clone kernel (histb branch, shallow)
+        run: |
+          for i in 1 2 3; do
+            git clone --depth 1 -b histb \
+              https://github.com/histb-mainline/linux.git mv100-linux && break
+            echo "clone failed, retrying..."; rm -rf mv100-linux; sleep 10
+          done
+          test -f mv100-linux/Makefile
+          git -C mv100-linux log -1 --format='%h %ad %s'
+
+      - name: Build
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p out
+          cp obj-mv100/arch/arm/boot/uImage-mv100.img out/
+          cp obj-mv100/arch/arm/boot/dts/hisilicon/hi3798mv100-ec6108v9c.dtb out/
+          cp obj-mv100/arch/arm/boot/zImage out/zImage
+          cp obj-mv100/.config out/kernel.config
+          ls -lh out/
+
+      - name: Upload uImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: mv100-uImage
+          path: out/
+          if-no-files-found: error
+          retention-days: 90
