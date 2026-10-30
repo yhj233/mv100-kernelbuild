@@ -151,12 +151,16 @@ ln -sf /lib/systemd/system/serial-getty@.service \
 
 # ---- 6. 清理镜像里不该留的东西 ----
 step "清理"
+# 先卸掉 /proc /sys /dev —— 否则 du、tar 会去扫那些随进程消失的 fd，
+# 单个文件 ENOENT 就足以让 du 返回 1，在 set -e 下把整个脚本带走。
+sync
+cleanup
 rm -f "$ROOT/usr/bin/qemu-arm-static"
 : >"$ROOT/etc/machine-id"
 rm -rf "$ROOT/var/lib/apt/lists"/* "$ROOT/var/cache/apt/archives"/*.deb
 rm -f "$ROOT/root/.bash_history"
 
-du -sh "$ROOT"
+du -sh "$ROOT" || true
 
 # ---- 7. 打包 ----
 step "打包 tar.xz"
