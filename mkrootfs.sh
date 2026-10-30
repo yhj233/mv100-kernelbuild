@@ -66,7 +66,7 @@ chroot "$ROOT" env DEBIAN_FRONTEND=noninteractive \
 	systemd-sysv systemd-resolved dbus \
 	openssh-server iproute2 iputils-ping \
 	curl ca-certificates nano vim-tiny less htop rsync \
-	e2fsprogs kmod udev
+	e2fsprogs kmod udev tzdata
 
 # ---- 4. 配置系统 ----
 step "写配置"
@@ -118,6 +118,14 @@ sed -i -e 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' \
 
 echo 'LANG=C.UTF-8' >"$ROOT/etc/default/locale"
 ln -sf /usr/share/zoneinfo/Asia/Shanghai "$ROOT/etc/localtime"
+
+# 串口上 root 登录：老的 login 会查 /etc/securetty，没列出的 tty 直接拒 root。
+# bookworm 已经基本不用这个文件了，存在就补上，不存在就跳过。
+if [ -f "$ROOT/etc/securetty" ]; then
+	for t in ttyAMA0 ttyS0 tty1; do
+		grep -qx "$t" "$ROOT/etc/securetty" || echo "$t" >>"$ROOT/etc/securetty"
+	done
+fi
 
 step "设置 root 密码 + 生成 host key"
 printf 'root:%s\n' "$ROOTPW" | chroot "$ROOT" chpasswd
