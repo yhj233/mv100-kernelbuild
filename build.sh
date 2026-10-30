@@ -12,6 +12,7 @@
 #   OUT=...    build output dir     (default: ./obj-mv100)
 #   CROSS=...  toolchain prefix     (default: arm-linux-gnueabihf-)
 #   JOBS=...   parallel jobs        (default: nproc)
+#   LOADADDR=  uImage load/entry    (default: 0x02000000, the vendor value)
 #
 # Requires: build-essential bc bison flex libssl-dev libncurses-dev
 #           kmod cpio rsync u-boot-tools gcc-arm-linux-gnueabihf
@@ -22,6 +23,7 @@ SRC=${SRC:-$PWD/mv100-linux}
 OUT=${OUT:-$PWD/obj-mv100}
 CROSS=${CROSS:-arm-linux-gnueabihf-}
 JOBS=${JOBS:-$(nproc 2>/dev/null || echo 4)}
+LOADADDR=${LOADADDR:-0x02000000}   # must match the vendor uImage header, see do_pack
 DTB=hi3798mv100-ec6108v9c.dtb
 UIMAGE=${UIMAGE:-uImage-mv100.img}
 
@@ -70,31 +72,45 @@ do_config() {
 	"${cfg[@]}" -e IR_HIX5HD2
 	"${cfg[@]}" -e RC_DECODER
 
-	# display: VDP2 master + on-chip HDMI transmitter
+	# display: VDP2 master.  The Hi3798MV100 drives an *external* SiI9134 HDMI
+	# transmitter, so the bridge is DRM_SII9134 (drivers/gpu/drm/bridge),
+	# NOT DRM_HISTB_HDMI -- that one is the on-chip HDMI of mv200 and is
+	# ARM64-only.  Without SII9134 the VDP2 CRTC has no downstream bridge
+	# and the display never comes up (serial console only).
 	"${cfg[@]}" -e DRM
 	"${cfg[@]}" -e DRM_HISTB_VDP2
-	"${cfg[@]}" -e DRM_HISTB_HDMI
+	"${cfg[@]}" -e DRM_SII9134
 	"${cfg[@]}" -e DRM_CLIENT_SELECTION
 	"${cfg[@]}" -e DRM_FBDEV_EMULATION
 
 	# GPU: Mali-450 via lima (defconfig ships it as =m)
 	"${cfg[@]}" -e DRM_LIMA
 
-	# audio: AIAO I2S TX port + sound card
+	# audio: SND / SND_SOC must be built in first, otherwise every ASoC driver
+	# is capped at =m and ends up in no image at all
+	"${cfg[@]}" -e SND
+	"${cfg[@]}" -e SND_SOC
 	"${cfg[@]}" -e SND_SOC_HISTB_AIAO_I2S
 	"${cfg[@]}" -e SND_SOC_HISTB_AIAO_CARD
 	"${cfg[@]}" -e SND_SIMPLE_CARD
 
-	# video codecs
+	# video codecs: same story with MEDIA_SUPPORT / VIDEO_DEV
+	"${cfg[@]}" -e MEDIA_SUPPORT
+	"${cfg[@]}" -e VIDEO_DEV
+	"${cfg[@]}" -e V4L2_MEM2MEM_DEV
 	"${cfg[@]}" -e VIDEO_HISTB_VDEC
 	"${cfg[@]}" -e VIDEO_HISTB_JPGD
 	"${cfg[@]}" -e VIDEO_HISTB_JPGE
 	"${cfg[@]}" -e VIDEO_HISTB_VENC
 
-	# boot: dual console, dtb appended to zImage
+	# boot: dual console, dtb appended to zImage, and let the bootloader's
+	# ATAGS (bootargs + memory size) be folded into the appended dtb --
+	# the board dts has no /memory node, memory comes from the ATAGS.
 	"${cfg[@]}" --set-str CMDLINE "console=tty0"
 	"${cfg[@]}" -e CMDLINE_EXTEND
 	"${cfg[@]}" -e ARM_APPENDED_DTB
+	"${cfg[@]}" -e ARM_ATAG_DTB_COMPAT
+	"${cfg[@]}" -e ARM_ATAG_DTB_COMPAT_CMDLINE_FROM_BOOTLOADER
 
 	make -C "$SRC" ARCH=arm CROSS_COMPILE="$CROSS" O="$OUT" olddefconfig
 
@@ -120,9 +136,16 @@ do_pack() {
 	[ -f "$boot/dts/hisilicon/$DTB" ] || die "$DTB missing"
 
 	step "packing uImage"
+	# Load/entry address must match what this bootloader expects.  On the
+	# EC6108V9C the stock bootargs partition carries:
+	#   bootcmd=mmc read 0 0x1FFFFC0 0x7000 0xA000;bootm 0x1FFFFC0
+	# and the vendor kernel image header says load=0x02000000 entry=0x02000000.
+	# 0x1FFFFC0 is the uImage header, i.e. 0x02000000 minus the 64-byte header.
+	# Using 0x00008000 here makes bootm relocate the kernel into low memory
+	# and the board hangs.
 	cat "$boot/zImage" "$boot/dts/hisilicon/$DTB" >"$boot/zImage-dtb"
 	mkimage -A arm -O linux -T kernel -C none \
-		-a 0x00008000 -e 0x00008000 \
+		-a "$LOADADDR" -e "$LOADADDR" \
 		-n "Linux mv100" -d "$boot/zImage-dtb" "$boot/$UIMAGE"
 
 	local sz
