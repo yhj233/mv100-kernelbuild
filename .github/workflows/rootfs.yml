@@ -47,13 +47,18 @@ jobs:
       - name: 确认 binfmt 里注册了 qemu-arm
         run: |
           set -eux
-          # qemu-user-static 的 binfmt 注册由 systemd-binfmt 完成；runner 上偶发没跑，
-          # 手动兜一下。没有这条注册，armhf 的 chroot 会直接 "Exec format error"。
+          # qemu-user-static 的 binfmt 注册由 systemd-binfmt 完成；runner 上偶发没跑。
+          # 没有这条注册，armhf 的 chroot 会直接 "Exec format error"。
+          # 注意：不要在这里 chmod /usr/bin/qemu-arm-static —— 包自带就是 0755，
+          # 而这一步没有 root，chmod 会以 EPERM 失败并把整个 job 带崩。
           if [ ! -e /proc/sys/fs/binfmt_misc/register ]; then
-            sudo mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc
+            sudo mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc || true
           fi
-          sudo update-binfmts --enable qemu-arm || true
-          chmod +x /usr/bin/qemu-arm-static
+          if [ ! -e /proc/sys/fs/binfmt_misc/qemu-arm ]; then
+            sudo systemctl restart systemd-binfmt || true
+            sudo update-binfmts --enable qemu-arm || true
+          fi
+          sudo update-binfmts --display qemu-arm || true
           if [ ! -e /proc/sys/fs/binfmt_misc/qemu-arm ]; then
             echo "::error::binfmt 里没有 qemu-arm，armhf chroot 跑不起来"
             ls -l /proc/sys/fs/binfmt_misc/ || true
