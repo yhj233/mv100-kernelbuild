@@ -27,6 +27,17 @@ LOADADDR=${LOADADDR:-0x02000000}   # must match the vendor uImage header, see do
 DTB=hi3798mv100-ec6108v9c.dtb
 UIMAGE=${UIMAGE:-uImage-mv100.img}
 
+# Everything the board needs at runtime must be =y: the uImage carries no
+# modules and the rootfs has no matching /lib/modules, so a =m driver simply
+# does not exist at boot. Checked after olddefconfig, see do_config.
+REQUIRED_Y="ARCH_HISI COMMON_CLK_HI3798MV100 REGULATOR_HISI_STB HISI_FEMAC
+	HISI_FESTA_PHY AMBA_PL08X MMC_DW_HI3798CV200 DRM DRM_HISTB_VDP2
+	DRM_SII9134 DRM_CLIENT_SELECTION DRM_FBDEV_EMULATION DRM_LIMA SOUND SND
+	SND_SOC SND_SOC_HDMI_CODEC SND_SOC_HISTB_AIAO_I2S SND_SOC_HISTB_AIAO_CARD
+	MEDIA_SUPPORT
+	VIDEO_DEV VIDEO_HISTB_VDEC VIDEO_HISTB_VENC VIDEO_HISTB_JPGD
+	ARM_APPENDED_DTB ARM_ATAG_DTB_COMPAT ARM_ATAG_DTB_COMPAT_CMDLINE_FROM_BOOTLOADER"
+
 die() { echo "error: $*" >&2; exit 1; }
 step() { printf '\n==> %s\n' "$*"; }
 
@@ -86,10 +97,15 @@ do_config() {
 	# GPU: Mali-450 via lima (defconfig ships it as =m)
 	"${cfg[@]}" -e DRM_LIMA
 
-	# audio: SND / SND_SOC must be built in first, otherwise every ASoC driver
-	# is capped at =m and ends up in no image at all
+	# audio: SOUND -> SND -> SND_SOC is a chain of tristates, and a child can
+	# never be more built-in than its parent. multi_v7_defconfig ships
+	# CONFIG_SOUND=m, so setting SND/SND_SOC to y silently degrades to m and
+	# every ASoC driver ends up in a module that the uImage does not carry.
+	# SOUND has to be flipped first.
+	"${cfg[@]}" -e SOUND
 	"${cfg[@]}" -e SND
 	"${cfg[@]}" -e SND_SOC
+	"${cfg[@]}" -e SND_SOC_HDMI_CODEC
 	"${cfg[@]}" -e SND_SOC_HISTB_AIAO_I2S
 	"${cfg[@]}" -e SND_SOC_HISTB_AIAO_CARD
 	"${cfg[@]}" -e SND_SIMPLE_CARD
@@ -115,8 +131,22 @@ do_config() {
 	make -C "$SRC" ARCH=arm CROSS_COMPILE="$CROSS" O="$OUT" olddefconfig
 
 	step "resulting mv100 options"
-	grep -E "HISTB|HI3798MV100|HISI_FESTA|FEMAC|LIMA|APPENDED_DTB|^CONFIG_CMDLINE" \
+	grep -E "HISTB|HI3798MV100|HISI_FESTA|FEMAC|LIMA|APPENDED_DTB|^CONFIG_CMDLINE|^CONFIG_SOUND|^CONFIG_SND" \
 		"$OUT/.config" || true
+
+	step "verifying every required option is built in"
+	local missing=0 sym got
+	for sym in $REQUIRED_Y; do
+		if ! grep -qx "CONFIG_$sym=y" "$OUT/.config"; then
+			got=$(grep -m1 -E "^CONFIG_$sym=|^# CONFIG_$sym is not set" "$OUT/.config" || true)
+			printf '  not built in: CONFIG_%s (%s)\n' "$sym" "${got:-absent}" >&2
+			missing=$((missing + 1))
+		fi
+	done
+	if [ "$missing" -gt 0 ]; then
+		die "$missing required option(s) are not =y -- the uImage would boot with them missing"
+	fi
+	echo "  all $(echo $REQUIRED_Y | wc -w) required options are =y"
 }
 
 do_build() {
