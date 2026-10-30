@@ -1,0 +1,103 @@
+name: Debian armhf rootfs
+
+# 给 Hi3798MV100 盒子造一份干净的 Debian armhf 根文件系统：
+#   带 openssh-server、root 密码登录、DHCP、串口 getty
+# 产出两个 artifact：
+#   debian-armhf-rootfs.tar.xz  —— 解到任意 ext4 分区
+#   debian-armhf-rootfs.img.gz  —— 2 GB ext4 镜像，直接 dd 到 /dev/mmcblk0p9
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "Debian 版本"
+        required: true
+        default: "bookworm"
+        type: choice
+        options: [bookworm, trixie]
+      root_password:
+        description: "root 密码"
+        required: true
+        default: "123456"
+      image_size:
+        description: "ext4 镜像大小（2G/4G，要装 XFCE 用 4G）"
+        required: true
+        default: "4G"
+
+concurrency:
+  group: rootfs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 安装 debootstrap + qemu-user-static
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            debootstrap qemu-user-static binfmt-support e2fsprogs xz-utils
+
+      - name: 确认 binfmt 里注册了 qemu-arm
+        run: |
+          set -eux
+          # qemu-user-static 的 binfmt 注册由 systemd-binfmt 完成；runner 上偶发没跑，
+          # 手动兜一下。没有这条注册，armhf 的 chroot 会直接 "Exec format error"。
+          if [ ! -e /proc/sys/fs/binfmt_misc/register ]; then
+            sudo mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc
+          fi
+          sudo update-binfmts --enable qemu-arm || true
+          chmod +x /usr/bin/qemu-arm-static
+          if [ ! -e /proc/sys/fs/binfmt_misc/qemu-arm ]; then
+            echo "::error::binfmt 里没有 qemu-arm，armhf chroot 跑不起来"
+            ls -l /proc/sys/fs/binfmt_misc/ || true
+            exit 1
+          fi
+
+      - name: 构建 rootfs
+        env:
+          SUITE: ${{ inputs.suite }}
+          ROOTPW: ${{ inputs.root_password }}
+          IMGSIZE: ${{ inputs.image_size }}
+          BOXNAME: mv100
+        run: |
+          set -eux
+          chmod +x mkrootfs.sh
+          sudo -E ./mkrootfs.sh
+
+      - name: 记录构建信息
+        run: |
+          {
+            echo "### Debian ${{ inputs.suite }} armhf rootfs"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 发行版 | ${{ inputs.suite }} |"
+            echo "| root 密码 | \`${{ inputs.root_password }}\` |"
+            echo "| 镜像大小 | ${{ inputs.image_size }} |"
+            echo "| 提交 | \`${GITHUB_SHA:0:7}\` |"
+            echo ""
+            echo "解压后 dd 到 kernel 之外的 rootfs 分区（EC6108V9C 上是 /dev/mmcblk0p9）。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传 tar.xz
+        uses: actions/upload-artifact@v4
+        with:
+          name: debian-armhf-rootfs-tar
+          path: debian-armhf-rootfs.tar.xz
+          compression-level: 0        # 本来就是 xz，别再压一遍
+          retention-days: 30
+
+      - name: 上传 ext4 镜像
+        uses: actions/upload-artifact@v4
+        with:
+          name: debian-armhf-rootfs-img
+          path: debian-armhf-rootfs.img.gz
+          compression-level: 0
+          retention-days: 30
