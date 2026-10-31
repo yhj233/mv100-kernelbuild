@@ -36,6 +36,8 @@ REQUIRED_Y="ARCH_HISI COMMON_CLK_HI3798MV100 REGULATOR_HISI_STB HISI_FEMAC
 	SND_SOC SND_SOC_HDMI_CODEC SND_SOC_HISTB_AIAO_I2S SND_SOC_HISTB_AIAO_CARD
 	MEDIA_SUPPORT
 	VIDEO_DEV VIDEO_HISTB_VDEC VIDEO_HISTB_VENC VIDEO_HISTB_JPGD
+	CGROUP_SCHED CGROUP_FREEZER CGROUP_DEVICE CGROUP_PIDS FANOTIFY
+	CMDLINE_PARTITION DEVTMPFS MMC_BLOCK EXT4_FS SERIAL_AMBA_PL011
 	ARM_APPENDED_DTB ARM_ATAG_DTB_COMPAT ARM_ATAG_DTB_COMPAT_CMDLINE_FROM_BOOTLOADER"
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -119,6 +121,29 @@ do_config() {
 	"${cfg[@]}" -e VIDEO_HISTB_JPGE
 	"${cfg[@]}" -e VIDEO_HISTB_VENC
 
+	# systemd: the rootfs on p9 is Ubuntu 20.04 (systemd 245), which runs in
+	# hybrid cgroup mode and expects the cgroup v1 controllers the vendor
+	# 4.4 kernel exposes.  With only CONFIG_CGROUPS=y systemd still boots but
+	# reports a missing controller set and loses resource accounting.
+	# FANOTIFY is what journald uses to notice log rotation.
+	"${cfg[@]}" -e CGROUP_SCHED
+	"${cfg[@]}" -e CGROUP_FREEZER
+	"${cfg[@]}" -e CGROUP_DEVICE
+	"${cfg[@]}" -e CGROUP_PIDS
+	"${cfg[@]}" -e FANOTIFY
+
+	# boot-critical plumbing.
+	# CMDLINE_PARTITION is what parses the vendor's blkdevparts= argument
+	# (upstream block/partitions/cmdline.c, __setup("blkdevparts=", ...)).
+	# The eMMC on this board has NO MBR/GPT at all -- the nine partitions
+	# exist only because that parser creates them.  Lose this option and
+	# root=/dev/mmcblk0p9 stops resolving, i.e. no root filesystem.
+	"${cfg[@]}" -e CMDLINE_PARTITION
+	"${cfg[@]}" -e DEVTMPFS
+	"${cfg[@]}" -e MMC_BLOCK
+	"${cfg[@]}" -e EXT4_FS
+	"${cfg[@]}" -e SERIAL_AMBA_PL011
+
 	# boot: dual console, dtb appended to zImage, and let the bootloader's
 	# ATAGS (bootargs + memory size) be folded into the appended dtb --
 	# the board dts has no /memory node, memory comes from the ATAGS.
@@ -131,7 +156,7 @@ do_config() {
 	make -C "$SRC" ARCH=arm CROSS_COMPILE="$CROSS" O="$OUT" olddefconfig
 
 	step "resulting mv100 options"
-	grep -E "HISTB|HI3798MV100|HISI_FESTA|FEMAC|LIMA|APPENDED_DTB|^CONFIG_CMDLINE|^CONFIG_SOUND|^CONFIG_SND" \
+	grep -E "HISTB|HI3798MV100|HISI_FESTA|FEMAC|LIMA|APPENDED_DTB|^CONFIG_CMDLINE|^CONFIG_SOUND|^CONFIG_SND|^CONFIG_CGROUP|^CONFIG_FANOTIFY|^CONFIG_MMC_BLOCK|^CONFIG_EXT4_FS|^CONFIG_SERIAL_AMBA" \
 		"$OUT/.config" || true
 
 	step "verifying every required option is built in"

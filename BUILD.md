@@ -181,10 +181,68 @@ bootcmd=mmc read 0 0x1FFFFC0 0x7000 0xA000;bootm 0x1FFFFC0
 
 ## 5. 上板（EC6108V9C 原厂 fastboot）
 
-### 5.1 先内存引导，别急着写 eMMC
+### 5.0 推荐路线：SSH 改两个分区，不用 tftp
+
+板子已经能 SSH 进去的话，**根本不需要串口和网络引导**。原理是把两个东西写进 eMMC：
+
+| 分区 | 大小 | 写什么 |
+|---|---|---|
+| `/dev/mmcblk0p6` | 20 MB | 新内核 `uImage-mv100.img` |
+| `/dev/mmcblk0p2` | 1 MB | 改过 `root=` 的启动参数 `bootargs-sd.bin` |
+
+原厂 `bootdelay=0` 看起来没法进 uboot 命令行，但 **`bootargs` 分区是纯文本 + CRC32 的简单格式**，
+可以在 PC 上离线改好再写回去，uboot 开机自己会读：
+
+```
+偏移 0x00：4 字节 = crc32(其余全部内容) 的小端值
+偏移 0x04：NUL 分隔的 key=value 字符串
+```
+
+改完重算 CRC 即可。`artifacts/bootargs-stock.bin` 是原厂原样复原件（md5 与固件包一致），
+证明生成器正确。顺带把 `bootdelay` 从 0 改成 3，以后开机有 3 秒窗口能按 Ctrl+C 进 `fastboot#`。
+
+流程：
+
+```bash
+# PC -> 盒子
+scp artifacts/uImage-mv100.img artifacts/bootargs-sd.bin \
+    switch-to-sd.sh install-rootfs.sh root@盒子IP:/root/
+# 盒子本机
+ssh root@盒子IP 'sh /root/switch-to-sd.sh'
+reboot
+```
+
+`switch-to-sd.sh` 会先备份 `p6`(内核)、`p2`(启动参数)、盘头 64 扇区到 `/root/kernel-backup/`，
+再写、再回读比对 sha256。**这三个备份务必 scp 拉回 PC 一份。**
+
+回滚（任何时刻）：
+
+```sh
+dd if=/root/kernel-backup/kernel-old.img   of=/dev/mmcblk0p6 bs=1M
+dd if=/root/kernel-backup/bootargs-old.bin of=/dev/mmcblk0p2 bs=1M
+reboot
+```
+
+### ⚠️ eMMC 上没有 MBR 分区表
+
+这是这条路上最容易被忽略的一条。原厂 eMMC 的 0 偏移就是 uboot 引导代码（`19 08 00 ea …`，
+尾部没有 `55 AA`），**分区全靠厂商内核的 `blkdevparts=` 参数凭空造出来**。主线内核不认这个参数，
+`block/partitions/` 里也没有他的补丁，DTS 里也没有 `partitions` 节点。
+
+所以在新内核眼里 eMMC 只有一整块 `/dev/mmcblk0`，**没有 `mmcblk0p1…p9`**。
+`root=/dev/mmcblk0p9` 在新内核下会直接 "VFS: Unable to mount root fs"。
+
+两条出路：
+
+1. **短期（零重编）**：Debian 住在 SD 卡上，`root=UUID=<SD卡>`，eMMC 原系统不动；
+2. **长期（要重编 dtb）**：给 `&emmc` 加 `fixed-partitions` 子节点，把厂商那套布局写进 DTS，
+   之后 `mmcblk0p9` 就有了，`root=/dev/mmcblk0p9` 原样有效。见 §6.2。
+
+### 5.1 没有 SSH 时：内存引导（需要 tftp）
 
 串口 115200 连上，开机打断进 `fastboot#`（`bootdelay=0`，需要在串口里一直发 Ctrl+C 抢）。
-确认命令能用：`help`、`printenv`。
+确认命令能用：`help`、`printenv`。板子出厂没编 `ext4load`，只有 `fatload`/`usb start`/`loady`，
+所以没法直接从 eMMC 的 ext4 分区里读文件，只能用网络或 USB。
 
 宿主机（Windows 上用 **Tftpd64**，把根目录指向解压后 img 所在文件夹；或 Linux 上 atftpd）
 和板子要在同一网段。板子默认：
@@ -204,9 +262,10 @@ bootimg 0x42000000
 ```
 
 - `0x42000000` 是 uImage **在 RAM 里的落点**，`bootimg` 会按头里的 load 地址把它搬到 `0x02000000`，两者别混。
-- 上面这串 `bootargs` 就是从你固件包的 `bootargs9-32.bin` 里抄的原厂值，`root=/dev/mmcblk0p9` 就是
-  `-(ubuntu)` 那个分区。`console=tty0` 由内核内置 cmdline 追加（`CMDLINE_EXTEND`），不用手写。
+- 上面这串 `bootargs` 就是从你固件包的 `bootargs9-32.bin` 里抄的原厂值。
 - 断电重启即恢复原厂内核，这一步不动 eMMC，随便试。
+- 换成 U 盘也行（uboot 有 `usb start` + `fatload`）：把 uImage 放在 FAT32 盘上，
+  `usb start; fatload usb 0:1 0x42000000 uImage-mv100.img; bootimg 0x42000000`。
 
 ### 5.2 确认没问题再写 eMMC（持久化）
 
@@ -230,28 +289,22 @@ mmc write 0 0x42000000 0x7000 0x6100        # 0x7000 = 14MB 偏移；0x6100 ≈ 
 
 所以写 eMMC 之前，**先确认 HiTool 能识别到板子**，别等砖了才找工具。
 
-### 5.4 另一条路：从正在运行的系统里写（SSH，不碰串口）
+### 5.4 只换内核、不动 rootfs（install-kernel.sh）
 
-板子现在跑着 4.4 厂商内核、能 SSH 的话，不用串口也不用 TFTP，直接把 uImage 怼进
-kernel 分区。用工作区里的 `install-kernel.sh`：
+如果只想先验内核、rootfs 保持原厂 Ubuntu，用 `install-kernel.sh`，它只动 `p6`：
 
 ```sh
 scp uImage-mv100.img root@盒子IP:/root/
-ssh root@盒子IP 'sh /root/install-kernel.sh /root/uImage-mv100.img'   # 交互确认
-ssh root@盒子IP 'AUTO=1 sh /root/install-kernel.sh /root/uImage-mv100.img'  # 跳过确认
+ssh root@盒子IP 'sh /root/install-kernel.sh /root/uImage-mv100.img'
 ```
 
-脚本会：校验 uImage magic → 检查大小是否放得下 20 MB 分区 → 备份现内核到
-`/root/kernel-backup/kernel-old.img` 和分区表 → 写入 → **回读比对 sha256**。
+校验 uImage magic → 检查是否放得下 20 MB 分区 → 备份原内核到
+`/root/kernel-backup/kernel-old.img` → 写入 → **回读比对 sha256**。
+`restore-kernel.sh` 负责回滚。
 
-失败回滚（只在新内核还能进 shell 时有意义）：
-
-```sh
-sh restore-kernel.sh
-```
-
-**这条路的风险比串口那条高**：`bootdelay=0`，没有交互窗口，新内核如果 panic 就直接停在那里，
-回滚脚本也没机会跑。所以要么先确认 HiTool 能连上，要么先走 5.1 的内存引导验一轮。
+⚠️ 但**只换内核的话大概率看不到东西**：原厂 rootfs 在 `mmcblk0p9`，
+而新内核没有分区表（见上面那段），`root=` 会失效。所以这条路只适合
+"我在别处已经解决分区问题"的情况，日常请走 5.0。
 
 写之前自己核对一眼分区，别把 kernel 写到 rootfs 上：
 
@@ -292,48 +345,138 @@ PasswordAuthentication yes     # 默认只认密钥
 
 ⚠️ **U 盘不行**：mv100 的 USB2 PHY（`hisilicon,hi3798mv100-usb2-phy`）在这个树里没有
 驱动，`ehci0` 会一直 probe defer，`lsusb` 空的。虽然 `USB_STORAGE=y`，但没 PHY 就没设备。
+（uboot 里的 USB 是另一套驱动，能用，但那只帮得上引导，帮不上挂根分区。）
 
-可用的两条路：
+#### 先搞清 mmcblk 编号
 
-**A. microSD（最简单）** — `&sd` 是 okay，走 `snps,dw-mshc`（`MMC_DW_PLTFM=y` 覆盖）。
-在 PC 上用 Win32DiskImager 把解压后的 `debian-armhf-rootfs.img` 直接写进卡，然后：
+dtsi 里 `emmc@9830000` 写在 `sd@9820000` 之前，作者也在注释里写死了
+`/* unremovable emmc as mmcblk0 */`。所以**插着卡时**：
 
-```
-setenv bootargs 'console=ttyAMA0,115200 root=/dev/mmcblk1 rootfstype=ext4 rootwait'
-tftp 0x42000000 uImage-mv100.img
-bootimg 0x42000000
-```
+| 设备 | 节点名 |
+|---|---|
+| eMMC | `/dev/mmcblk0` |
+| SD 卡 | `/dev/mmcblk1` |
 
-⚠️ **`root=` 后面没有分区号，是整卡。** 产出的是**裸 ext4 镜像**（`mkfs.ext4 -d` 直接
-做在文件上，没有 MBR 分区表），写进卡之后文件系统就占满整张卡，`/dev/mmcblk1` 本身就是
-那个文件系统。这也正是后面 `dd` 到 eMMC `/dev/mmcblk0p9` 需要的格式——那个分区同样是
-一个裸文件系统。想在 PC 上看卡内容要用支持 ext4 的工具，Windows 资源管理器看不见。
-
-⚠️ **`mmcblk` 编号别猜。** mainline DTS 里 `sd@9820000` 在 `emmc@9830000` 之前注册，
-插卡时 SD 很可能抢到 `mmcblk0`、eMMC 变 `mmcblk1`，和原厂 DTS 正好相反。用 CID 认：
+想自己确认：eMMC 会多出 `boot0`/`boot1` 硬件分区。
 
 ```sh
-cat /sys/block/mmcblk*/device/name     # eMMC 显示芯片型号，SD 显示卡型号
-ls /sys/block/mmcblk*/                  # eMMC 通常还多出 boot0/boot1
+for d in /sys/block/mmcblk*; do [ -e "$d/boot0" ] && echo "eMMC = /dev/$(basename $d)"; done
 ```
 
-所以 rootfs 镜像里**故意不写 `/etc/fstab` 的 `/` 条目**——两份镜像 LABEL 相同，
-写死设备名或 LABEL 都会在"SD 和 eMMC 同时存在"时选错。
+#### 路线 A：Debian 住 SD 卡（零重编，今天就能跑）
 
-Debian 起来、SSH 通了，再从卡上系统把 img `dd` 到 eMMC 的 rootfs 分区（注意先
-`umount` 不相关的东西、`dd` 时 `bs=1M` 别加 `conv=fsync` 以外的东西）：
+`&sd` 是 okay，走 `snps,dw-mshc`（`MMC_DW_PLTFM=y` 覆盖），卡检测走控制器内部的 CDETECT。
+
+1. **PC 写卡**：Win32DiskImager 把 `artifacts/debian-armhf-rootfs.img`（4 GB，裸 ext4）
+   写进卡。写的是**裸文件系统，没有分区表**，所以卡上 `/` 就是 `/dev/mmcblk1` 本身，
+   没有 `p1`。Windows 会弹"需要格式化"——别理它，那是它读不懂 ext4。
+2. **改启动参数**：`artifacts/bootargs-sd.bin` 已经把 `root=` 换成
+   `root=UUID=0052686e-5a26-48f6-b2d2-eafdf1477d17`（就是镜像里那个 UUID）。
+   用 UUID 而不是 `/dev/mmcblk1` 是为了不依赖枚举顺序——eMMC 整盘在偏移 1024 处
+   没有 ext4 超级块，不会被误匹配。
+3. **写进去再重启**：`sh switch-to-sd.sh`（见 §5.0），reboot。
+
+起来之后先撑满卡：
 
 ```sh
-# 在 SD 上的 Debian 里，向 eMMC 的 rootfs 分区写入同一份镜像
-gunzip -c /root/debian-armhf-rootfs.img.gz | dd of=/dev/mmcblk0p9 bs=1M conv=fsync status=progress
-sync
+resize2fs /dev/mmcblk1        # 卡多大就撑多大
 ```
 
-然后串口把 bootargs 改回 `root=/dev/mmcblk0p9`，拔卡重启。**全程不动 eMMC 直到这一步，
-失败了拔卡就回到原系统。**
+#### 路线 B：Debian 落到 eMMC（长期方案，要重编 dtb）
 
-**B. 网络刷（没有卡时）** — 需要一个内核内置 initramfs 的"刷机内核"：起机后自己
-从 PC 拉 img 写进 p9。比 A 多一次构建，但完全不需要额外硬件。
+要在 eMMC 上跑，必须先解决 §5 里那个"新内核看不到分区"的问题。两种改法：
+
+**B1. 给 DTS 加 fixed-partitions（推荐）**
+
+在原厂布局的 `&emmc` 节点里补上分区表，`root=/dev/mmcblk0p9` 就原样有效了：
+
+```dts
+&emmc {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		partition@0 {
+			label = "boot";
+			reg = <0x00000000 0x00100000>;	/* p1  1 MB   uboot，只读别动 */
+			read-only;
+		};
+		partition@100000 {
+			label = "bootargs";
+			reg = <0x00100000 0x00100000>;	/* p2  1 MB */
+		};
+		partition@200000 {
+			label = "baseparam";
+			reg = <0x00200000 0x00400000>;	/* p3  4 MB */
+		};
+		partition@600000 {
+			label = "pqparam";
+			reg = <0x00600000 0x00400000>;	/* p4  4 MB */
+		};
+		partition@a00000 {
+			label = "logo";
+			reg = <0x00a00000 0x00400000>;	/* p5  4 MB */
+		};
+		partition@e00000 {
+			label = "kernel";
+			reg = <0x00e00000 0x01400000>;	/* p6 20 MB */
+		};
+		partition@2200000 {
+			label = "busybox";
+			reg = <0x02200000 0x04000000>;	/* p7 64 MB */
+		};
+		partition@6200000 {
+			label = "backup";
+			reg = <0x06200000 0x20000000>;	/* p8 512 MB */
+		};
+		partition@26200000 {
+			label = "rootfs";
+			reg = <0x26200000 0x1d9e00000>;	/* p9 610 MB 起，到盘尾 */
+		};
+	};
+};
+```
+
+⚠️ 改这一段的时候有三个坑：
+
+1. **必须原样保留 9 个分区**，编号才对得上。少写一个（比如把 `baseparam` 和 `pqparam`
+   并成一段），后面全部前移，`p9` 就变成 `p8`，`root=` 立刻失效。
+2. **第一个分区必须从 `0` 开始**（内核 ofpart 解析器对首分区偏移有要求），所以 `boot`
+   那段留着占位并标 `read-only`，别让任何东西往它写——那 1 MB 就是 uboot 本体。
+3. **`rootfs` 长度要按实际 eMMC 容量算**：
+
+   | eMMC | p9 长度 | DTS 里写 |
+   |---|---|---|
+   | 4 GB | 3486 MB | `0x0d9e00000` |
+   | 8 GB | 7582 MB | `0x1d9e00000` |
+   | 16 GB | 15774 MB | `0x3d9e00000` |
+
+   先 SSH 进去 `cat /proc/partitions` 看 `mmcblk0` 的总扇区数（×512 就是字节数）再定。
+   **如果是 4 GB 的机器，p9 只有 3.4 GB，装不下 4 GB 镜像**，rootfs 要改用 `IMGSIZE=2G`
+   重跑一次 workflow。
+
+**B2. 在 SD 卡上起 Debian，再从那儿覆写 p9**
+
+`install-rootfs.sh` 就是干这个的：它在 SD 卡启动的 Debian 里跑，
+自动认出 eMMC（靠 `boot0` 判断）、检查 p9 够不够大、`gunzip | dd` 写进去、
+回读 superblock 校验、`resize2fs` 撑满、最后 `tune2fs -U random` 打散 UUID
+（避免和 SD 卡上那份撞车）。
+
+```sh
+# SD 卡启动的 Debian 里
+scp root@PC:/path/debian-armhf-rootfs.img.gz /root/     # 或用 U 盘、或先传到老系统
+sh install-rootfs.sh /root/debian-armhf-rootfs.img.gz
+poweroff        # 拔卡，开机
+```
+
+**注意**：这条只有在 B1 也做了、`mmcblk0p9` 真的存在之后才有意义。否则写进去的东西
+新内核根本看不见。
+
+#### 路线 C：网络刷（没有卡时）
+
+需要一个内核内置 initramfs 的"刷机内核"：起机后自己从 PC 拉 img 写进 p9。
+比 A/B 多一次构建，但完全不需要额外硬件。
 
 ### 6.3 起来之后补 XFCE
 
