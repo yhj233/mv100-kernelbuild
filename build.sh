@@ -120,6 +120,19 @@ do_config() {
 	"${cfg[@]}" -e RTL8XXXU
 	"${cfg[@]}" -e LEDS_CLASS
 
+	# firmware: rtl8xxxu is built in and probes at ~1.65 s, while the rootfs on
+	# p9 does not mount until ~1.69 s.  request_firmware() always loses that
+	# race, so /lib/firmware is not reachable yet and the probe dies with
+	#   Direct firmware load for rtlwifi/rtl8188fufw.bin failed with error -2
+	# leaving no wlan0 (a manual unbind/bind later works, which is how this was
+	# diagnosed).  Embedding the blob into the image sidesteps the ordering.
+	fwdir="$PWD/firmware"
+	[ -f "$fwdir/rtlwifi/rtl8188fufw.bin" ] ||
+		die "firmware/rtlwifi/rtl8188fufw.bin missing (CONFIG_EXTRA_FIRMWARE needs it)"
+	"${cfg[@]}" -e EXTRA_FIRMWARE
+	"${cfg[@]}" --set-str EXTRA_FIRMWARE "rtlwifi/rtl8188fufw.bin"
+	"${cfg[@]}" --set-str EXTRA_FIRMWARE_DIR "$fwdir"
+
 	# IR remote
 	"${cfg[@]}" -e IR_HIX5HD2
 	"${cfg[@]}" -e RC_DECODER
