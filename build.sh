@@ -40,6 +40,7 @@ REQUIRED_Y="ARCH_HISI COMMON_CLK_HI3798MV100 REGULATOR_HISI_STB HISI_FEMAC
 	CMDLINE_PARTITION DEVTMPFS MMC_BLOCK EXT4_FS SERIAL_AMBA_PL011
 	PHY_HISI_INNO_USB2 USB_EHCI_HCD USB_EHCI_HCD_PLATFORM
 	USB_OHCI_HCD USB_OHCI_HCD_PLATFORM CFG80211 MAC80211 RTL8XXXU
+	ZRAM ZSMALLOC LZ4_COMPRESS LZ4_DECOMPRESS
 	ARM_APPENDED_DTB ARM_ATAG_DTB_COMPAT ARM_ATAG_DTB_COMPAT_CMDLINE_FROM_BOOTLOADER"
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -119,6 +120,17 @@ do_config() {
 	"${cfg[@]}" -e MAC80211
 	"${cfg[@]}" -e RTL8XXXU
 	"${cfg[@]}" -e LEDS_CLASS
+
+	# zram: compressed RAM swap.  1 GB of RAM with Firefox running means the
+	# disk swap on eMMC gets hit constantly; zram trades a few CPU cycles for
+	# ~2x compression, which on this board is an order of magnitude faster
+	# than swapping to eMMC.  ZRAM is simply absent from multi_v7_defconfig
+	# and the uImage carries no modules, so it has to be built in.
+	# Both backends are kept: the default stays lzo-rle (cheapest on a
+	# Cortex-A7), the setup script switches to lz4 when it is available.
+	"${cfg[@]}" -e ZRAM
+	"${cfg[@]}" -e ZRAM_BACKEND_LZO
+	"${cfg[@]}" -e ZRAM_BACKEND_LZ4
 
 	# firmware: rtl8xxxu is built in and probes at ~1.65 s, while the rootfs on
 	# p9 does not mount until ~1.69 s.  request_firmware() always loses that
