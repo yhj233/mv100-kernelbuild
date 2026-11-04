@@ -38,6 +38,8 @@ REQUIRED_Y="ARCH_HISI COMMON_CLK_HI3798MV100 REGULATOR_HISI_STB HISI_FEMAC
 	VIDEO_DEV VIDEO_HISTB_VDEC VIDEO_HISTB_VENC VIDEO_HISTB_JPGD
 	CGROUP_SCHED CGROUP_FREEZER CGROUP_DEVICE CGROUP_PIDS FANOTIFY
 	CMDLINE_PARTITION DEVTMPFS MMC_BLOCK EXT4_FS SERIAL_AMBA_PL011
+	PHY_HISI_INNO_USB2 USB_EHCI_HCD USB_EHCI_HCD_PLATFORM
+	USB_OHCI_HCD USB_OHCI_HCD_PLATFORM
 	ARM_APPENDED_DTB ARM_ATAG_DTB_COMPAT ARM_ATAG_DTB_COMPAT_CMDLINE_FROM_BOOTLOADER"
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -91,6 +93,23 @@ do_config() {
 
 	# storage
 	"${cfg[@]}" -e MMC_DW_HI3798CV200
+
+	# USB: two EHCI+OHCI host pairs (9880/9890 and 9920/9930), each behind an
+	# INNO USB2 PHY described as a child of peripheral-controller@8a20000.
+	# multi_v7_defconfig ships PHY_HISI_INNO_USB2 as a *module*; the uImage
+	# carries no modules, so the PHY never registers and both host pairs sit
+	# in probe limbo forever:
+	#   platform f9890000.usb: deferred probe pending: platform: wait for
+	#     supplier .../usb2-phy@124/phy@1
+	# -> no /sys/bus/usb/devices, no keyboard, no stick.  The generic
+	# ehci/ohci platform glue is already =y, only the PHY is missing.
+	"${cfg[@]}" -e PHY_HISI_INNO_USB2
+	"${cfg[@]}" -e USB_EHCI_HCD
+	"${cfg[@]}" -e USB_EHCI_HCD_PLATFORM
+	"${cfg[@]}" -e USB_OHCI_HCD
+	"${cfg[@]}" -e USB_OHCI_HCD_PLATFORM
+	"${cfg[@]}" -e USB_STORAGE
+	"${cfg[@]}" -e USB_HID
 
 	# IR remote
 	"${cfg[@]}" -e IR_HIX5HD2
