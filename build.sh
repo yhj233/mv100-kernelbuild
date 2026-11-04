@@ -63,6 +63,18 @@ need_tools() {
 }
 
 do_config() {
+	# 本地补丁：patches/ 下按"源码树相对路径"存放已改好的文件，直接覆盖。
+	# 用于修上游还没修的问题（见 patches/README 与 _src/ 里的说明）。
+	if [ -d "$PWD/patches" ]; then
+		step "applying local patches"
+		local f
+		while IFS= read -r f; do
+			mkdir -p "$SRC/$(dirname "$f")"
+			cp "$PWD/patches/$f" "$SRC/$f"
+			echo "  patched $f"
+		done < <(cd "$PWD/patches" && find . -type f ! -name 'README*' | sed 's|^\./||')
+	fi
+
 	step "configuring (multi_v7_defconfig + mv100 options)"
 	mkdir -p "$OUT"
 	make -C "$SRC" ARCH=arm CROSS_COMPILE="$CROSS" O="$OUT" multi_v7_defconfig
