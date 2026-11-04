@@ -31,7 +31,7 @@ UIMAGE=${UIMAGE:-uImage-mv100.img}
 # modules and the rootfs has no matching /lib/modules, so a =m driver simply
 # does not exist at boot. Checked after olddefconfig, see do_config.
 REQUIRED_Y="ARCH_HISI COMMON_CLK_HI3798MV100 REGULATOR_HISI_STB HISI_FEMAC
-	HISI_FESTA_PHY AMBA_PL08X MMC_DW_HI3798CV200 DRM DRM_HISTB_VDP2
+	MDIO_HISI_FEMAC HISI_FESTA_PHY AMBA_PL08X MMC_DW_HI3798CV200 DRM DRM_HISTB_VDP2
 	DRM_SII9134 DRM_CLIENT_SELECTION DRM_FBDEV_EMULATION DRM_LIMA SOUND SND
 	SND_SOC SND_SOC_HDMI_CODEC SND_SOC_HISTB_AIAO_I2S SND_SOC_HISTB_AIAO_CARD
 	MEDIA_SUPPORT
@@ -74,6 +74,17 @@ do_config() {
 	# ethernet + Festa PHY (PHY needs hisilicon/festa.<id>.ucode to be fully happy)
 	"${cfg[@]}" -e HISI_FEMAC
 	"${cfg[@]}" -e HISI_FESTA_PHY
+
+	# MDIO bus controller -- the missing link between the two above.
+	# HISI_FEMAC is only the MAC; it reaches the PHY through the MDIO bus
+	# provided by MDIO_HISI_FEMAC (drivers/net/mdio/mdio-hisi-femac.c,
+	# compatible "hisilicon,hisi-femac-mdio").  multi_v7_defconfig leaves it
+	# off, and the failure mode is silent and confusing: the platform device
+	# f9841100.mdio exists but binds to no driver, /sys/class/mdio_bus shows
+	# only the virtual fixed-0, then hisi_femac_probe() reports
+	#   "hisi-femac f9840000.ethernet: connect to PHY failed!"
+	# and returns -ENODEV (not -EPROBE_DEFER, so never retried) -> no eth0.
+	"${cfg[@]}" -e MDIO_HISI_FEMAC
 
 	# DMA: upstream amba-pl08x (the old histb-dma was dropped from the tree)
 	"${cfg[@]}" -e AMBA_PL08X

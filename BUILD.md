@@ -5,6 +5,28 @@
 
 ---
 
+## 当前状态（2026-10-31 15:45）
+
+板上已经做完了前两步，**只差重启**：
+
+| 项 | 状态 |
+|---|---|
+| p6 kernel | ✅ 已写入 7.3 内核（12.17 MB，CI run #5，`sha256 0f072aaf…`），回读校验一致 |
+| p2 bootargs | ✅ `bootdelay` 0 → 3，其余 17 个变量逐字节未动，CRC 重算并校验通过 |
+| 原内核备份 | ✅ 设备 `/root/kernel-backup/p6-kernel-orig.img` + PC `artifacts/p6-kernel-orig.img`，两处 sha256 一致（`a0bcc792…`） |
+| 原 bootargs 备份 | ✅ 设备 `/root/kernel-backup/p2-bootargs-orig.bin` + PC `artifacts/p2-bootargs-orig.bin` |
+| 回滚脚本 | ✅ 设备 `/root/kernel-backup/rollback.sh` |
+| 重启 | ⬜ 未做，等人在串口前 |
+
+**当前系统仍在跑内存里的 4.4.35**，写入没有影响运行中的系统（已核对根分区可写、uptime 连续）。
+
+⚠️ **下次开机就会用 7.3**。如果这段时间断电重启，而新内核起不来，SSH 会一起消失，
+只剩串口和 HiTool 两条路。`bootdelay=3` 给了 3 秒进 U-Boot 的窗口。
+
+新内核 config 自检 37 项全绿，`=m` 929 个（uImage 不带模块，需要的东西都内建了）。
+
+---
+
 ## 编译路线怎么选
 
 | 路线 | 适合 | 编一次 | 痛点 |
@@ -223,20 +245,27 @@ dd if=/root/kernel-backup/bootargs-old.bin of=/dev/mmcblk0p2 bs=1M
 reboot
 ```
 
-### ⚠️ eMMC 上没有 MBR 分区表
+### eMMC 上没有 MBR，但 `blkdevparts=` 是上游支持的
 
-这是这条路上最容易被忽略的一条。原厂 eMMC 的 0 偏移就是 uboot 引导代码（`19 08 00 ea …`，
-尾部没有 `55 AA`），**分区全靠厂商内核的 `blkdevparts=` 参数凭空造出来**。主线内核不认这个参数，
-`block/partitions/` 里也没有他的补丁，DTS 里也没有 `partitions` 节点。
+原厂 eMMC 的 0 偏移就是 uboot 引导代码（`19 08 00 ea …`，尾部没有 `55 AA`），
+**没有 MBR/GPT 分区表**，九个分区是 `bootargs` 里的 `blkdevparts=` 凭空造出来的。
 
-所以在新内核眼里 eMMC 只有一整块 `/dev/mmcblk0`，**没有 `mmcblk0p1…p9`**。
-`root=/dev/mmcblk0p9` 在新内核下会直接 "VFS: Unable to mount root fs"。
+早先这里写的是"主线内核不认这个参数、必须改 DTS 加 fixed-partitions"——**那是错的**。
+`blkdevparts=` 是 2013 年就进了上游的东西，实现就在 `block/partitions/cmdline.c`：
 
-两条出路：
+```
+__setup("blkdevparts=", cmdline_parts_setup);
+```
 
-1. **短期（零重编）**：Debian 住在 SD 卡上，`root=UUID=<SD卡>`，eMMC 原系统不动；
-2. **长期（要重编 dtb）**：给 `&emmc` 加 `fixed-partitions` 子节点，把厂商那套布局写进 DTS，
-   之后 `mmcblk0p9` 就有了，`root=/dev/mmcblk0p9` 原样有效。见 §6.2。
+对应 `CONFIG_CMDLINE_PARTITION`，`multi_v7_defconfig` 里本来就是 `=y`，`build.sh` 也把它
+钉进了配置自检门（37 项之一）。所以**现有 bootargs 原样传下去，`mmcblk0p1…p9` 就会正常出现**，
+`root=/dev/mmcblk0p9` 直接有效，DTS 一个字不用改。
+
+唯一要记住的是：这个选项一旦没开（比如换了 defconfig），p9 就会消失，而现象只是
+"VFS: Unable to mount root fs"，很容易误判成驱动问题。这就是它被写进自检门的原因。
+
+> 顺带纠一个更早的猜测：eMMC 是 `mmcblk0`（dtsi 里 `emmc@9830000` 在 `sd@9820000` 之前，
+> 且标了 `non-removable`），SD 卡是 `mmcblk1`，和原厂 `root=/dev/mmcblk0p9` 一致。
 
 ### 5.1 没有 SSH 时：内存引导（需要 tftp）
 
@@ -382,96 +411,35 @@ for d in /sys/block/mmcblk*; do [ -e "$d/boot0" ] && echo "eMMC = /dev/$(basenam
 resize2fs /dev/mmcblk1        # 卡多大就撑多大
 ```
 
-#### 路线 B：Debian 落到 eMMC（长期方案，要重编 dtb）
+#### 路线 B：Debian 落到 eMMC（长期方案）
 
-要在 eMMC 上跑，必须先解决 §5 里那个"新内核看不到分区"的问题。两种改法：
+`blkdevparts=` 是上游解析器（见 §5 那段），所以**不需要改 DTS**，`mmcblk0p9` 在新内核下
+本来就会出现。剩下的问题只是"怎么往一个正在被当作根分区的分区里写东西"——你没法在线覆盖它，
+必须从另一个系统写。
 
-**B1. 给 DTS 加 fixed-partitions（推荐）**
+两条：
 
-在原厂布局的 `&emmc` 节点里补上分区表，`root=/dev/mmcblk0p9` 就原样有效了：
+**B1. 从 SD 卡上的系统写（推荐）**
 
-```dts
-&emmc {
-	partitions {
-		compatible = "fixed-partitions";
-		#address-cells = <1>;
-		#size-cells = <1>;
-
-		partition@0 {
-			label = "boot";
-			reg = <0x00000000 0x00100000>;	/* p1  1 MB   uboot，只读别动 */
-			read-only;
-		};
-		partition@100000 {
-			label = "bootargs";
-			reg = <0x00100000 0x00100000>;	/* p2  1 MB */
-		};
-		partition@200000 {
-			label = "baseparam";
-			reg = <0x00200000 0x00400000>;	/* p3  4 MB */
-		};
-		partition@600000 {
-			label = "pqparam";
-			reg = <0x00600000 0x00400000>;	/* p4  4 MB */
-		};
-		partition@a00000 {
-			label = "logo";
-			reg = <0x00a00000 0x00400000>;	/* p5  4 MB */
-		};
-		partition@e00000 {
-			label = "kernel";
-			reg = <0x00e00000 0x01400000>;	/* p6 20 MB */
-		};
-		partition@2200000 {
-			label = "busybox";
-			reg = <0x02200000 0x04000000>;	/* p7 64 MB */
-		};
-		partition@6200000 {
-			label = "backup";
-			reg = <0x06200000 0x20000000>;	/* p8 512 MB */
-		};
-		partition@26200000 {
-			label = "rootfs";
-			reg = <0x26200000 0x1d9e00000>;	/* p9 610 MB 起，到盘尾 */
-		};
-	};
-};
-```
-
-⚠️ 改这一段的时候有三个坑：
-
-1. **必须原样保留 9 个分区**，编号才对得上。少写一个（比如把 `baseparam` 和 `pqparam`
-   并成一段），后面全部前移，`p9` 就变成 `p8`，`root=` 立刻失效。
-2. **第一个分区必须从 `0` 开始**（内核 ofpart 解析器对首分区偏移有要求），所以 `boot`
-   那段留着占位并标 `read-only`，别让任何东西往它写——那 1 MB 就是 uboot 本体。
-3. **`rootfs` 长度要按实际 eMMC 容量算**：
-
-   | eMMC | p9 长度 | DTS 里写 |
-   |---|---|---|
-   | 4 GB | 3486 MB | `0x0d9e00000` |
-   | 8 GB | 7582 MB | `0x1d9e00000` |
-   | 16 GB | 15774 MB | `0x3d9e00000` |
-
-   先 SSH 进去 `cat /proc/partitions` 看 `mmcblk0` 的总扇区数（×512 就是字节数）再定。
-   **如果是 4 GB 的机器，p9 只有 3.4 GB，装不下 4 GB 镜像**，rootfs 要改用 `IMGSIZE=2G`
-   重跑一次 workflow。
-
-**B2. 在 SD 卡上起 Debian，再从那儿覆写 p9**
-
-`install-rootfs.sh` 就是干这个的：它在 SD 卡启动的 Debian 里跑，
-自动认出 eMMC（靠 `boot0` 判断）、检查 p9 够不够大、`gunzip | dd` 写进去、
-回读 superblock 校验、`resize2fs` 撑满、最后 `tune2fs -U random` 打散 UUID
-（避免和 SD 卡上那份撞车）。
+先按路线 A 让 Debian 从卡起来，然后：
 
 ```sh
-# SD 卡启动的 Debian 里
-scp root@PC:/path/debian-armhf-rootfs.img.gz /root/     # 或用 U 盘、或先传到老系统
+# 卡上系统里跑
+scp root@PC:/path/debian-armhf-rootfs.img.gz /root/
 sh install-rootfs.sh /root/debian-armhf-rootfs.img.gz
-poweroff        # 拔卡，开机
 ```
 
-**注意**：这条只有在 B1 也做了、`mmcblk0p9` 真的存在之后才有意义。否则写进去的东西
-新内核根本看不见。
+`install-rootfs.sh` 会自动认出 eMMC（靠 `boot0` 判断，别靠编号猜）、检查 p9 容量、
+`gunzip | dd` 写进去、回读 superblock 校验、`resize2fs` 撑满、最后 `tune2fs -U random`
+换掉 UUID（避免和卡上那份撞车）。
+
+p9 有 **6.53 GiB**（实测 `Block count 1711616 × 4096`），4 GB 镜像装得下，撑满后能用 6.5 G。
+
+**B2. 从原厂 Ubuntu 里"借"一个临时根**——不推荐，要 remount 根分区为只读、
+往另一个 mount namespace 里写，比 B1 危险得多。
+
+> 之前这里写的是"给 `&emmc` 加 fixed-partitions、重编 dtb"，那是基于"主线不认 blkdevparts"
+> 的错误判断。现在不需要了。
 
 #### 路线 C：网络刷（没有卡时）
 
@@ -500,6 +468,16 @@ systemctl set-default graphical.target
 
 ## 7. 起来之后先验这几条
 
+**前三条决定"能不能活"，先看它们，别的都是后话：**
+
+```bash
+cat /proc/cmdline | tr ' ' '\n' | grep -E "root=|blkdevparts"   # root= 要指向 mmcblk0p9
+lsblk                                                          # p1..p9 在不在（CMDLINE_PARTITION）
+cat /sys/block/mmcblk0/device/name                             # 应为 M72808
+```
+
+**然后是驱动：**
+
 ```bash
 dmesg | grep -iE "histb|vdp|sii9134|lima|pl08x|festa|aiao"
 cat /proc/device-tree/model                      # Huawei EC6108V9C
@@ -511,6 +489,24 @@ aplay -l                                         # AIAO 声卡
 v4l2-ctl --list-formats-out -d /dev/video0       # NV21_16L16（16x16 tiled）
 es2_info; kmscube                                # lima 是否真的活
 ```
+
+**如果网口没起来**（`ip link` 里没有 eth0，或一直 NO-CARRIER）：主线用的是 FEMAC 而不是
+vendor 的 `hieth`，且 PHY 的 microcode 固件 `festa.<id>.ucode` 不在系统里。这时只能串口操作。
+先 `dmesg | grep -i femac` 看 probe 到哪一步。
+
+**如果 `lsblk` 里没有 p1..p9**：说明 `CMDLINE_PARTITION` 没生效或 `blkdevparts=` 没传进来。
+内核会报 `VFS: Cannot open root device`。这是唯一一个"内核启动了但进不了系统"的典型症状。
+
+---
+
+## 回滚（板上现成的）
+
+```sh
+sh /root/kernel-backup/rollback.sh    # p6 → 原厂 4.4.35，p2 → bootdelay=0
+reboot
+```
+
+只能在这个系统能登录时用。如果新内核根本起不来（没 SSH），走 §5.3：串口 U-Boot 或 HiTool。
 
 ---
 
