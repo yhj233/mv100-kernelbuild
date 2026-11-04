@@ -39,7 +39,7 @@ REQUIRED_Y="ARCH_HISI COMMON_CLK_HI3798MV100 REGULATOR_HISI_STB HISI_FEMAC
 	CGROUP_SCHED CGROUP_FREEZER CGROUP_DEVICE CGROUP_PIDS FANOTIFY
 	CMDLINE_PARTITION DEVTMPFS MMC_BLOCK EXT4_FS SERIAL_AMBA_PL011
 	PHY_HISI_INNO_USB2 USB_EHCI_HCD USB_EHCI_HCD_PLATFORM
-	USB_OHCI_HCD USB_OHCI_HCD_PLATFORM
+	USB_OHCI_HCD USB_OHCI_HCD_PLATFORM CFG80211 MAC80211 RTL8XXXU
 	ARM_APPENDED_DTB ARM_ATAG_DTB_COMPAT ARM_ATAG_DTB_COMPAT_CMDLINE_FROM_BOOTLOADER"
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -110,6 +110,15 @@ do_config() {
 	"${cfg[@]}" -e USB_OHCI_HCD_PLATFORM
 	"${cfg[@]}" -e USB_STORAGE
 	"${cfg[@]}" -e USB_HID
+
+	# wireless: the on-board USB dongle is an RTL8188F (0bda:f179, "802.11n").
+	# multi_v7_defconfig ships CFG80211/MAC80211 as modules and leaves
+	# RTL8XXXU off, so with a module-less uImage there is no wireless stack
+	# at all -- the dongle enumerates on the bus but never gets a wlan iface.
+	"${cfg[@]}" -e CFG80211
+	"${cfg[@]}" -e MAC80211
+	"${cfg[@]}" -e RTL8XXXU
+	"${cfg[@]}" -e LEDS_CLASS
 
 	# IR remote
 	"${cfg[@]}" -e IR_HIX5HD2
