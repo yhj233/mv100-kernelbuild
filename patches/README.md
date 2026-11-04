@@ -52,3 +52,27 @@ drm_crtc_vblank_off(crtc);
 - Mesa 侧要配合 `_deploy/fake-drm-name/` 的 `libfake_drm_name.so`：把 card0 报的驱动名
   从 `histb-vdp2` 改成 kmsro 认识的名字（`sun4i-drm`），Mesa 才会用 lima 渲染、
   经 DMA-BUF 交给 vdp2 扫描输出。只有 vblank 修好之后这条路才跑得动。
+
+## lima_pp.c —— PP 出错时 dump task 描述符与 VM 页表（**临时诊断补丁**）
+
+**目的**：lima 在 X/kmsro 负载下持续报
+
+```
+lima f9200000.gpu: pp0 error irq state=201 status=40
+lima f9200000.gpu: pp0 task error 0 / pp1 task error 1 int_state=0 status=0
+lima f9200000.gpu: pp0/pp1 reset time out
+```
+
+`state=0x201` 拆开是 `BIT(0) END_OF_FRAME | BIT(9) INVALID_PLIST_COMMAND`
+（`lima_regs.h: LIMA_PP_IRQ_INVALID_PLIST_COMMAND`），即 GPU 读到的图元命令流非法，
+不是直觉上的"总线错误"。要确定是「PLIST 地址指向错地方」还是「命令本身不合法」，
+需要看出错那一刻的：
+
+- `task->frame` 的原始内容（GPU 实际执行的描述符）
+- 该 task 的 VM 页表（VA → 物理地址映射）
+- `int_state` 的位含义（避免再靠猜）
+
+**改动**（只加打印，不动逻辑）：在 `lima_pp_task_error()` 里对 `pipe->current_task`
+dump 前 32 个 u32 描述符、`vm->pd.dma`、前两个 `bts[]` 的物理页和一个页表窗口。
+
+**注意**：这是诊断用的，定位完应当删除（`patches/` 里删掉即可，build.sh 就不覆盖了）。
