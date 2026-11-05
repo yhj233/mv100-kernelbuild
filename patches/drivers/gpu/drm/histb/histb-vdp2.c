@@ -1448,13 +1448,33 @@ static void histb_vdp2_crtc_atomic_flush(struct drm_crtc *crtc,
 	}
 
 	/*
-	 * The VDP latches the whole frame at once and the vblank IRQ only marks
-	 * the count, so send the flip event right after the commit.
+	 * Queue the flip event on the *next* vblank rather than sending it from
+	 * here.  drm_crtc_send_vblank_event() stamps the event with
+	 * drm_vblank_count_and_time(), i.e. the count of the vblank that has
+	 * already been processed.  Two commits landing inside one vblank period
+	 * therefore hand back two events carrying the same sequence, and any
+	 * client that treats it as a frame counter -- mpv prints "Got the same
+	 * msc value twice ... Possibly broken driver/interlaced mode?" -- sees
+	 * the second one as a bogus flip.
+	 *
+	 * drm_crtc_arm_vblank_event() puts the event on dev->vblank_event_list
+	 * with sequence = accurate_count + 1 and lets the following vblank IRQ
+	 * release it with the real count.  The vblank reference taken here is
+	 * the one drm_handle_vblank_events() drops when it fires; vblank_get()
+	 * uses vbl_lock, so it is safe under event_lock (same as sun4i).  If
+	 * vblank happens to be disabled the get fails, and the event is sent
+	 * inline instead so a client never waits on a flip that cannot arrive.
 	 */
 	if (new_state->event) {
-		spin_lock_irq(&crtc->dev->event_lock);
-		drm_crtc_send_vblank_event(crtc, new_state->event);
+		struct drm_pending_vblank_event *event = new_state->event;
+
 		new_state->event = NULL;	/* consumed: keep hw_done quiet */
+
+		spin_lock_irq(&crtc->dev->event_lock);
+		if (drm_crtc_vblank_get(crtc) == 0)
+			drm_crtc_arm_vblank_event(crtc, event);
+		else
+			drm_crtc_send_vblank_event(crtc, event);
 		spin_unlock_irq(&crtc->dev->event_lock);
 	}
 }

@@ -45,15 +45,72 @@ drm_crtc_vblank_off(crtc);
 **验证**：直接改寄存器 `INTMSK` 清 bit0 后，`vbcount` 立刻按 60 Hz 增长
 （5 秒 +300），确认硬件与中断链路本身没问题，纯粹是没使能。
 
+## histb-vdp2.c —— flip 事件改走 vblank 队列（重复 MSC）
+
+**症状**：vblank 修好之后，客户端日志开始刷
+
+```
+Got the same msc value twice ... Possibly broken driver/interlaced mode?
+```
+
+**原因**：`atomic_flush()` 里直接调 `drm_crtc_send_vblank_event()`。这个函数用
+`drm_vblank_count_and_time()` 取序号，也就是**最近一次已经处理过的** vblank 计数
+（`drm_vblank.c`：`seq = drm_vblank_count_and_time(dev, pipe, &now)`）。两次 commit
+如果落在同一个 vblank 周期内，两个事件就带着**完全相同的 seq** 发出去。任何把 seq
+当帧计数器用的客户端（mpv 的 `--vo=gpu`）都会把第二个判成重复 flip。
+
+原来的注释写的是"VDP 整帧锁存，所以提交后立刻发事件"。前半句对，后半句错的：
+锁存说的是像素生效时机，和事件该带哪个序号是两件事。
+
+**修法**：改成 arm，让事件等下一个 vblank 由中断里发。
+
+```c
+if (new_state->event) {
+	struct drm_pending_vblank_event *event = new_state->event;
+
+	new_state->event = NULL;	/* 必须：hw_done 有 WARN_ON(event) */
+
+	spin_lock_irq(&crtc->dev->event_lock);
+	if (drm_crtc_vblank_get(crtc) == 0)
+		drm_crtc_arm_vblank_event(crtc, event);
+	else
+		drm_crtc_send_vblank_event(crtc, event);   /* vblank 不可用时的兜底 */
+	spin_unlock_irq(&crtc->dev->event_lock);
+}
+```
+
+三个约束都是查 `drm_vblank.c` / `drm_atomic_helper.c` 确认的，不是照抄：
+
+- `drm_crtc_arm_vblank_event()` 只是把事件挂到 `dev->vblank_event_list` 并置
+  `sequence = accurate_vblank_count() + 1`，**它自己不做 vblank_get**。
+- 消费方 `drm_handle_vblank_events()` 在发事件前会 `drm_vblank_put(dev, pipe)`，
+  所以 arm 之前必须自己 `drm_crtc_vblank_get()`，否则引用计数被 put 穿。
+- `drm_atomic_helper_commit_hw_done()` 里有 `WARN_ON(new_crtc_state->event)`，
+  所以 `new_state->event` 必须在 flush 里清掉。
+- `drm_crtc_vblank_get()` 走 `vbl_lock`，不碰 `event_lock`，在 `event_lock` 内调用
+  不会自死锁（sun4i 也是这么写的）。
+
+disable 路径不会漏事件：`drm_crtc_vblank_off()` 会遍历 `vblank_event_list`，
+逐个 `list_del` + `drm_vblank_put` + `send_vblank_event`，挂起的事件会被冲掉。
+
 ## 顺带
 
-- `histb-vdp2.c` 里那段 5 秒一次的 `vbcount=` 打印是 bring-up 用的探针，
-  修好之后可以删掉（位置在 `histb_vdp2_irq_handler()` 末尾，标了 `[LOCAL]`）。
-- Mesa 侧要配合 `_deploy/fake-drm-name/` 的 `libfake_drm_name.so`：把 card0 报的驱动名
-  从 `histb-vdp2` 改成 kmsro 认识的名字（`sun4i-drm`），Mesa 才会用 lima 渲染、
-  经 DMA-BUF 交给 vdp2 扫描输出。只有 vblank 修好之后这条路才跑得动。
+- `histb-vdp2.c` 里那段 5 秒一次的 `vbcount=` 打印是 bring-up 用的探针
+  （`histb_vdp2_irq_handler()` 末尾，标了 `[LOCAL]`）。**暂时保留**：它是判断
+  vblank 是否真的在推进的唯一直接证据，而 vblank 是本驱动全部问题的源头。
+  等整条链路稳定几轮再删。
+- Mesa 侧 kmsro 认驱动名靠的是 **编译期静态映射**，`histb-vdp2` 不在表里。
+  两种绕法等价，后者更省事（不用编译 .so、不用 LD_PRELOAD）：
+  - `_deploy/fake-drm-name/` 的 `libfake_drm_name.so`，把 card0 报的名字改成 `sun4i-drm`
+  - 或者直接 `MESA_LOADER_DRIVER_OVERRIDE=sun4i-drm`（**推荐**，已实测等效）
 
-## lima_pp.c —— PP 出错时 dump 现场（**临时诊断补丁，结论已被推翻**）
+## lima_pp.c —— 已删除
+
+原来是 PP 报错时的现场 dump 补丁，用来查 `job timeout`。结论是**那次排查的
+方向错了**，补丁只剩日志噪音，已经从 `patches/` 删掉（`build.sh` 不再覆盖，
+`lima_pp.c` 回到上游原样）。这一段留作复盘，见下面"已被证伪的一轮"。
+
+## lima_pp.c 复盘 —— PP 出错时 dump 现场（**已被证伪**）
 
 > 这一节记录的是**已经被证伪**的一轮排查，留在这里是因为下面"运维经验"那几条
 > 踩坑成本很高。**不要再按这里的思路继续挖 PP**。当前有效结论见本节末尾。
