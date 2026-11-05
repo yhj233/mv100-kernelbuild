@@ -4,6 +4,7 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/device.h>
+#include <linux/jiffies.h>
 #include <linux/slab.h>
 
 #include <drm/lima_drm.h>
@@ -73,8 +74,114 @@ static irqreturn_t lima_pp_irq_handler(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
-/* Diagnostic only: keep the "still active" spam bounded. */
+/*
+ * Diagnostic only (temporary): capture the hardware state at the moment a PP
+ * reports RENDERING_ACTIVE while having no pending interrupt and pipe->error
+ * still clear.  That is the real stall -- by the time the job timeout fires
+ * ten seconds later the error path has already masked interrupts and the DLBU
+ * registers have been torn down, so dumping there shows nothing useful.
+ *
+ * dev->dlbu_cpu is the one page the DLBU hardware maintains the master tile
+ * list in, so it can be read from the CPU and tells us how far the tile
+ * walker got.
+ */
 static int lima_pp_active_log;
+
+static void lima_pp_stall_dump(struct lima_device *dev,
+			       struct lima_sched_pipe *pipe, int idx)
+{
+	struct lima_ip *ip;
+	void __iomem *m;
+	int i, n;
+
+	if (lima_pp_active_log >= 14)
+		return;
+
+	n = lima_pp_active_log++;
+
+	if (n < 3) {
+		dev_err(dev->dev,
+			"[stall] #%d pp=%d done=%08x task=%d error=%d jiffies=%lu\n",
+			n, idx, pipe->done, atomic_read(&pipe->task),
+			pipe->error, jiffies);
+
+		ip = dev->ip + lima_ip_gp;
+		if (ip->present) {
+			m = ip->iomem;
+			dev_err(dev->dev,
+				"[stall] gp status=%08x rawstat=%08x intstat=%08x\n",
+				readl(m + LIMA_GP_STATUS),
+				readl(m + LIMA_GP_INT_RAWSTAT),
+				readl(m + LIMA_GP_INT_STAT));
+			dev_err(dev->dev,
+				"[stall] gp vsread=%08x vs=[%08x..%08x] plbu=[%08x..%08x] alloc=[%08x..%08x]\n",
+				readl(m + LIMA_GP_VSCL_START_ADDR_READ),
+				readl(m + LIMA_GP_VSCL_START_ADDR),
+				readl(m + LIMA_GP_VSCL_END_ADDR),
+				readl(m + LIMA_GP_PLBUCL_START_ADDR),
+				readl(m + LIMA_GP_PLBUCL_END_ADDR),
+				readl(m + LIMA_GP_PLBU_ALLOC_START_ADDR),
+				readl(m + LIMA_GP_PLBU_ALLOC_END_ADDR));
+		}
+
+		for (i = 0; i < pipe->num_processor; i++) {
+			ip = dev->ip + lima_ip_pp0 + i;
+			if (!ip->present)
+				continue;
+			m = ip->iomem;
+			dev_err(dev->dev,
+				"[stall] pp%d status=%08x rawstat=%08x intstat=%08x intmask=%08x curlist=%08x frame=%08x stack=%08x stacksz=%08x ctrl=%08x\n",
+				i, readl(m + LIMA_PP_STATUS),
+				readl(m + LIMA_PP_INT_RAWSTAT),
+				readl(m + LIMA_PP_INT_STATUS),
+				readl(m + LIMA_PP_INT_MASK),
+				readl(m + LIMA_PP_CURRENT_REND_LIST_ADDR),
+				readl(m + LIMA_PP_FRAME),
+				readl(m + LIMA_PP_STACK),
+				readl(m + LIMA_PP_STACK_SIZE),
+				readl(m + LIMA_PP_CTRL));
+		}
+
+		ip = dev->ip + lima_ip_dlbu;
+		if (ip->present) {
+			m = ip->iomem;
+			dev_err(dev->dev,
+				"[stall] dlbu phys=%08x vaddr=%08x vbase=%08x fbdim=%08x conf=%08x tilepos=%08x enmask=%08x\n",
+				readl(m + LIMA_DLBU_MASTER_TLLIST_PHYS_ADDR),
+				readl(m + LIMA_DLBU_MASTER_TLLIST_VADDR),
+				readl(m + LIMA_DLBU_TLLIST_VBASEADDR),
+				readl(m + LIMA_DLBU_FB_DIM),
+				readl(m + LIMA_DLBU_TLLIST_CONF),
+				readl(m + LIMA_DLBU_START_TILE_POS),
+				readl(m + LIMA_DLBU_PP_ENABLE_MASK));
+		}
+
+		if (dev->dlbu_cpu)
+			print_hex_dump(KERN_ERR, "[stall] tllist: ",
+				       DUMP_PREFIX_OFFSET, 16, 4,
+				       dev->dlbu_cpu, 64, false);
+
+		if (pipe->current_task && pipe->current_task->frame)
+			print_hex_dump(KERN_ERR, "[stall] frame: ",
+				       DUMP_PREFIX_OFFSET, 16, 4,
+				       pipe->current_task->frame, 320, false);
+	} else {
+		/* Later hits: only the fields that would move if the PP made
+		 * any progress, so we can tell "stuck forever" from "slow".
+		 */
+		ip = pipe->processor[idx];
+		if (ip && ip->present) {
+			m = ip->iomem;
+			dev_err(dev->dev,
+				"[stall] #%d pp%d status=%08x rawstat=%08x curlist=%08x frame=%08x stack=%08x\n",
+				n, idx, readl(m + LIMA_PP_STATUS),
+				readl(m + LIMA_PP_INT_RAWSTAT),
+				readl(m + LIMA_PP_CURRENT_REND_LIST_ADDR),
+				readl(m + LIMA_PP_FRAME),
+				readl(m + LIMA_PP_STACK));
+		}
+	}
+}
 
 static irqreturn_t lima_pp_bcast_irq_handler(int irq, void *data)
 {
@@ -121,14 +228,7 @@ static irqreturn_t lima_pp_bcast_irq_handler(int irq, void *data)
 				 * and let the reset happen right away.
 				 */
 				if (!pipe->error) {
-					if (lima_pp_active_log < 10) {
-						lima_pp_active_log++;
-						dev_err(dev->dev,
-							"[pp] %s still active rawstat=%08x status=%08x\n",
-							lima_ip_name(ip),
-							pp_read(LIMA_PP_INT_RAWSTAT),
-							status);
-					}
+					lima_pp_stall_dump(dev, pipe, i);
 					continue;
 				}
 			}
