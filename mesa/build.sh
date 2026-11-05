@@ -48,6 +48,7 @@ apt-get install -y -qq --no-install-recommends \
   libx11-dev libxext-dev libxfixes-dev libx11-xcb-dev \
   libxcb1-dev libxcb-dri2-0-dev libxcb-dri3-dev libxcb-present-dev \
   libxcb-sync-dev libxcb-shm0-dev libxcb-xfixes0-dev \
+  libxcb-glx0-dev \
   libxshmfence-dev libxrandr-dev libxxf86vm-dev libxdamage-dev \
   ca-certificates curl xz-utils file
 echo "--- installed ---"
