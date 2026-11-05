@@ -86,16 +86,80 @@ ls /usr/lib/arm-linux-gnueabihf/pkgconfig/ 2>/dev/null | grep -E 'drm|xcb|x11|ex
 
 echo
 echo "=============================================================="
-echo " 3b. bump libdrm.pc version 2.4.107 -> 2.4.109 (version spoof)"
+echo " 3b. cross-build libdrm 2.4.109 (mesa 23.3 needs >=2.4.109)"
 echo "=============================================================="
-# Mesa 23.3.6 requires libdrm >= 2.4.109 but focal ships 2.4.107 (and the
-# device runs 2.4.107).  The 2.4.109 bump only adds amdgpu-only symbols
-# (drmGetDeviceFromDevId etc.); lima uses only drmIoctl/drmGetVersion/
-# drmFreeVersion/drmFreeDevice, all present since long before 2.4.107.  So we
-# just bump the .pc Version string so meson's check passes -- no real ABI need.
-LDPC=/usr/lib/arm-linux-gnueabihf/pkgconfig/libdrm.pc
-sed -i 's/^Version: .*/Version: 2.4.109/' "$LDPC"
-grep '^Version:' "$LDPC"
+# Mesa 23.3.6 requires libdrm >= 2.4.109, but focal ships 2.4.107 (and the
+# device runs 2.4.107).  Critically, mesa's src/loader/loader.c calls
+# drmGetDevice2() and drmGetDeviceFromDevId(), which are NEW symbols added in
+# 2.4.109 -- they do NOT exist in 2.4.107's headers OR .so, so a version-spoof
+# fails at compile time with -Werror=implicit-function-declaration.
+#
+# So we genuinely cross-build libdrm 2.4.109 as a BUILD-ONLY dependency (for
+# its headers + pkg-config metadata), and DO NOT install it on the device.
+# The device's 2.4.107 runtime stays put: lima's own code paths (drmIoctl,
+# drmCommandWriteRead, drmGetVersion, ...) use symbols unchanged since
+# <2.4.107, and the loader's new-symbol calls are guarded / only hit on render
+# node probing paths that lima exercises minimally.
+LIBDRM_VER=2.4.109
+cd "$WORK"
+rm -rf libdrm-src
+mkdir -p libdrm-src
+cd libdrm-src
+curl -fsSL --retry 3 --retry-delay 5 -m 300 \
+  "https://gitlab.freedesktop.org/mesa/libdrm/-/archive/libdrm-$LIBDRM_VER/libdrm-libdrm-$LIBDRM_VER.tar.gz" \
+  -o /tmp/libdrm.tar.gz \
+  || curl -fsSL --retry 3 --retry-delay 5 -m 300 \
+  "https://dri.freedesktop.org/libdrm/libdrm-$LIBDRM_VER.tar.xz" \
+  -o /tmp/libdrm.tar.xz
+if [ -f /tmp/libdrm.tar.gz ]; then
+  tar xzf /tmp/libdrm.tar.gz
+  d=$(ls -d libdrm-* | head -1)
+elif [ -f /tmp/libdrm.tar.xz ]; then
+  tar xJf /tmp/libdrm.tar.xz
+  d=$(ls -d libdrm-* | head -1)
+else
+  echo "!! cannot fetch libdrm source"; exit 1
+fi
+[ -n "$d" ] && mv "$d"/* . 2>/dev/null && rmdir "$d" 2>/dev/null
+echo "libdrm source root: $(pwd)"
+ls -d . >/dev/null && test -f meson.build && echo "meson.build present" || { echo "!! libdrm tree broken"; exit 1; }
+
+# Install libdrm directly INTO the cross toolchain's sysroot so its headers,
+# .so and libdrm.pc land exactly where the cross gcc + pkg-config already look.
+# This eliminates any stage-dir prefix mismatch for mesa's meson build.
+SYSROOT=$("$CROSS-gcc" -print-sysroot)
+echo "cross sysroot: $SYSROOT"
+
+cat > /tmp/libdrm-cross.txt <<EOF
+[binaries]
+c = '${CROSS}-gcc'
+ar = '${CROSS}-ar'
+strip = '${CROSS}-strip'
+pkgconfig = 'pkg-config'
+
+[properties]
+sys_root = '$SYSROOT'
+
+[host_machine]
+system = 'linux'
+cpu_family = 'arm'
+cpu = 'armv7l'
+endian = 'little'
+EOF
+meson setup _build --cross-file /tmp/libdrm-cross.txt \
+  --buildtype=release --prefix=/usr --libdir=lib/arm-linux-gnueabihf \
+  -Dudev=false -Dintel=false -Dradeon=false -Damdgpu=false -Dnouveau=false \
+  -Dvmwgfx=false -Domap=false -Dexynos=false -Dfreedreno=false -Dtegra=false \
+  -Dvc4=false -Detnaviv=false -Dman-pages=false \
+  -Dvalgrind=false -Dcairo-tests=false -Dinstall-test-programs=false
+ninja -C _build -j"$(nproc)"
+DESTDIR="$SYSROOT" ninja -C _build install
+# verify the headers + libdrm.pc landed in the sysroot
+echo "--- sysroot libdrm.h ---"
+ls -l "$SYSROOT/usr/include/libdrm/" 2>/dev/null | head
+echo "--- sysroot libdrm.pc ---"
+find "$SYSROOT" -name 'libdrm.pc' 2>/dev/null | head
+grep '^Version:' "$(find "$SYSROOT" -name 'libdrm.pc' | head -1)" 2>/dev/null || echo "!! libdrm.pc not found in sysroot"
 
 echo
 echo "=============================================================="
@@ -222,8 +286,24 @@ nm -D "$SO" | grep '__driDriverGetExtensions_lima' || echo "!! lima symbol missi
 mkdir -p "$OUT"
 cp "$SO" "$OUT/libgallium_dri.so"
 sha256sum "$OUT/libgallium_dri.so" | tee "$OUT/sha256.txt"
+
+# Also export the cross-built libdrm.so.2.4.0 (soname libdrm.so.2) so the device
+# can be upgraded from 2.4.107 -> 2.4.109 (adds drmGetDeviceFromDevId, needed by
+# mesa 23.3's loader.c).  Backward compatible: soname unchanged, only new symbols.
+LIBDRM_SO=$(find "$SYSROOT" -name 'libdrm.so.2.4.0' | head -1)
+if [ -n "$LIBDRM_SO" ]; then
+  cp "$LIBDRM_SO" "$OUT/libdrm.so.2.4.0"
+  echo "libdrm.so.2.4.0 exported:"
+  ls -l "$OUT/libdrm.so.2.4.0"
+  echo "--- libdrm NEW symbols ---"
+  nm -D "$OUT/libdrm.so.2.4.0" | grep -E 'drmGetDeviceFromDevId|drmGetDevice2' || echo "(none)"
+else
+  echo "!! libdrm.so.2.4.0 not found in sysroot, skipping export"
+fi
+
 echo "GLIBC max: $(readelf --version-info "$SO" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu | tail -1)" > "$OUT/info.txt"
 echo "mesa: $MESA_VER" >> "$OUT/info.txt"
+echo "libdrm: 2.4.109 (exported libdrm.so.2.4.0)" >> "$OUT/info.txt"
 chmod -R a+rX "$OUT"
 ls -l "$OUT"
 echo "===== DONE ====="
