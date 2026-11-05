@@ -105,21 +105,44 @@ cd "$WORK"
 rm -rf libdrm-src
 mkdir -p libdrm-src
 cd libdrm-src
-curl -fsSL --retry 3 --retry-delay 5 -m 300 \
-  "https://gitlab.freedesktop.org/mesa/libdrm/-/archive/libdrm-$LIBDRM_VER/libdrm-libdrm-$LIBDRM_VER.tar.gz" \
-  -o /tmp/libdrm.tar.gz \
-  || curl -fsSL --retry 3 --retry-delay 5 -m 300 \
-  "https://dri.freedesktop.org/libdrm/libdrm-$LIBDRM_VER.tar.xz" \
-  -o /tmp/libdrm.tar.xz
-if [ -f /tmp/libdrm.tar.gz ]; then
-  tar xzf /tmp/libdrm.tar.gz
-  d=$(ls -d libdrm-* | head -1)
-elif [ -f /tmp/libdrm.tar.xz ]; then
-  tar xJf /tmp/libdrm.tar.xz
-  d=$(ls -d libdrm-* | head -1)
-else
+echo "  fetching libdrm $LIBDRM_VER ..."
+# 1) prefer the vendored tarball shipped in this repo (no network needed)
+if [ -f "$WORK/mesa/libdrm-$LIBDRM_VER.tar.gz" ]; then
+  cp "$WORK/mesa/libdrm-$LIBDRM_VER.tar.gz" /tmp/libdrm.tar
+  echo "  using vendored $WORK/mesa/libdrm-$LIBDRM_VER.tar.gz ($(stat -c%s /tmp/libdrm.tar) bytes)"
+fi
+# 2) fallback to network sources
+if [ ! -f /tmp/libdrm.tar ]; then
+  for u in \
+    "https://gitlab.freedesktop.org/mesa/libdrm/-/archive/libdrm-$LIBDRM_VER/libdrm-libdrm-$LIBDRM_VER.tar.gz" \
+    "https://dri.freedesktop.org/libdrm/libdrm-$LIBDRM_VER.tar.xz" \
+  ; do
+    echo "  -> $u"
+    if curl -fsSL --retry 2 --retry-delay 3 -m 120 -o /tmp/libdrm.tar "$u" 2>/tmp/libdrm.curlerr; then
+      sz=$(stat -c%s /tmp/libdrm.tar 2>/dev/null || echo 0)
+      echo "     got $sz bytes"
+      if [ "$sz" -gt 100000 ]; then
+        break
+      fi
+      rm -f /tmp/libdrm.tar
+    else
+      echo "     curl FAILED: $(cat /tmp/libdrm.curlerr 2>/dev/null | head -3)"
+      rm -f /tmp/libdrm.tar
+    fi
+  done
+fi
+if [ ! -f /tmp/libdrm.tar ]; then
   echo "!! cannot fetch libdrm source"; exit 1
 fi
+# detect archive type by magic bytes
+if head -c 2 /tmp/libdrm.tar | grep -q $'\x1f\x8b'; then
+  tar xzf /tmp/libdrm.tar
+elif head -c 2 /tmp/libdrm.tar | grep -q $'\xfd7'; then
+  tar xJf /tmp/libdrm.tar
+else
+  echo "!! unknown archive type"; exit 1
+fi
+d=$(ls -d libdrm-* | head -1)
 [ -n "$d" ] && mv "$d"/* . 2>/dev/null && rmdir "$d" 2>/dev/null
 echo "libdrm source root: $(pwd)"
 ls -d . >/dev/null && test -f meson.build && echo "meson.build present" || { echo "!! libdrm tree broken"; exit 1; }
