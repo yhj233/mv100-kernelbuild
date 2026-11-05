@@ -47,20 +47,28 @@ echo "cross glibc max: $(strings "$("$CROSS-gcc" -print-sysroot)/lib/arm-linux-g
 
 # armhf libraries Mesa links against.  dpkg --add-architecture lets apt pull the
 # :armhf .so/.pc side by side with the native amd64 ones.  armhf lives on
-# ports.ubuntu.com (not archive.ubuntu.com), so add a dedicated [arch=armhf] source.
+# ports.ubuntu.com (not archive/security.ubuntu.com), so we add a dedicated
+# [arch=armhf] source.
 #
-# ALSO: the runner's default sources.list has archive/security.ubuntu.com entries
-# with NO arch qualifier.  Once armhf is added, `apt update` tries to fetch the
-# armhf Packages index from those amd64-only hosts -> 404 (this is exactly what
-# killed the earlier runs).  So we pin the existing entries to [arch=amd64] and let
-# only the ports.ubuntu.com entries below carry armhf.
+# ALSO: the runner's default sources (both the old one-line /etc/apt/sources.list
+# AND any deb822 /etc/apt/sources.list.d/*.sources on GitHub/Azure runners) have NO
+# arch qualifier.  Once armhf is added, `apt update` tries to fetch the armhf
+# Packages index from those amd64-only hosts (security.ubuntu.com etc.) -> 404,
+# which is exactly what killed the earlier runs.  So we nuke every pre-existing
+# source and write ONE clean set: amd64 -> archive/security.ubuntu.com, armhf ->
+# ports.ubuntu.com.  No sed guessing about file format.
 sudo dpkg --add-architecture armhf
-sudo sed -i -E 's#^deb (\[[^]]+\] )?(https?://(security|archive)\.ubuntu\.com/ubuntu)#deb [arch=amd64] \2#' /etc/apt/sources.list
-sudo tee /etc/apt/sources.list.d/armhf-ports.list >/dev/null <<'EOF'
-deb [arch=armhf] http://ports.ubuntu.com/ubuntu-ports jammy main universe
-deb [arch=armhf] http://ports.ubuntu.com/ubuntu-ports jammy-updates main universe
-deb [arch=armhf] http://ports.ubuntu.com/ubuntu-ports jammy-security main universe
-deb [arch=armhf] http://ports.ubuntu.com/ubuntu-ports jammy-backports main universe
+sudo rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+sudo tee /etc/apt/sources.list >/dev/null <<'EOF'
+deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy main universe restricted multiverse
+deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy-updates main universe restricted multiverse
+deb [arch=amd64] http://security.ubuntu.com/ubuntu jammy-security main universe restricted multiverse
+deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy-backports main universe restricted multiverse
+
+deb [arch=armhf] http://ports.ubuntu.com/ubuntu-ports jammy main universe restricted multiverse
+deb [arch=armhf] http://ports.ubuntu.com/ubuntu-ports jammy-updates main universe restricted multiverse
+deb [arch=armhf] http://ports.ubuntu.com/ubuntu-ports jammy-security main universe restricted multiverse
+deb [arch=armhf] http://ports.ubuntu.com/ubuntu-ports jammy-backports main universe restricted multiverse
 EOF
 sudo apt-get update -qq
 sudo apt-get install -y -qq --no-install-recommends \
