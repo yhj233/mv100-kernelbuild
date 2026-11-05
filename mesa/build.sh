@@ -209,6 +209,14 @@ pkgconfig = 'pkg-config'
 pkg_config_libdir = ['/usr/lib/arm-linux-gnueabihf/pkgconfig', '/usr/share/pkgconfig']
 sys_root = '$("$CROSS-gcc" -print-sysroot)'
 
+[built-in options]
+# We link against focal glibc 2.31, where pthread/dl/rt are still SEPARATE libs
+# (glibc merged them into libc only at 2.34).  The jammy gcc 11 -pthread/-ldl
+# flags assume >=2.34 semantics (no -lpthread/-ldl needed), so we force them back
+# so pthread_once/dlopen/etc. resolve from focal's libpthread.so.0/libdl.so.2.
+c_link_args = ['-lpthread', '-ldl', '-lrt']
+cpp_link_args = ['-lpthread', '-ldl', '-lrt']
+
 [host_machine]
 system = 'linux'
 cpu_family = 'arm'
