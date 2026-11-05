@@ -1,0 +1,50 @@
+name: build mesa 23.3.6 lima_dri.so (focal cross)
+
+# A/B build of Mesa 23.3.6's lima driver (pure upstream, no patches) to rule
+# out a userspace command-stream bug behind the PP hang on Hi3798MV100.
+#
+# Same focal amd64 container + arm-linux-gnueabihf cross toolchain (gcc 9.3,
+# glibc 2.31) as mesa-focal-cross.yml, but:
+#   - Mesa bumped 21.2.6 -> 23.3.6 (meson>=0.60)
+#   - cross-builds libdrm 2.4.109 as a build dep (focal has 2.4.107, too old)
+#
+# Output: artifact `lima_dri_233` with libgallium_dri.so + sha256 + info.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout (this repo)
+        uses: actions/checkout@v4
+
+      - name: Build (amd64 focal container, cross-compile armhf)
+        run: |
+          docker run --rm \
+            --platform linux/amd64 \
+            -v "$PWD":/work \
+            -w /work \
+            -e WORK=/work \
+            ubuntu:20.04 \
+            bash /work/mesa/build_focal_cross_233.sh
+          echo "--- out/ ---"
+          ls -l out || true
+
+      - name: Collect artifact
+        if: always()
+        run: |
+          ls -l out || true
+          [ -f out/libgallium_dri.so ] && cat out/info.txt || echo "no .so produced"
+
+      - name: Upload libgallium_dri.so
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lima_dri_233
+          path: out/*
+          if-no-files-found: warn
+          retention-days: 30
