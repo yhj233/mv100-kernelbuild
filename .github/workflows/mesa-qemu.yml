@@ -1,0 +1,52 @@
+name: build mesa lima_dri.so (qemu focal)
+
+# Builds Mesa 21.2.6's lima driver NATIVELY inside an armhf ubuntu:20.04
+# (focal) container via qemu-user emulation.  This is the CORRECT path for the
+# Hi3798MV100 box: it links against glibc 2.31 (focal), so the .so loads
+# unchanged on the device.  (The cross-compile path links against glibc 2.35 and
+# stamps GLIBC_2.32+ symbols, which focal can't resolve.)
+#
+# Output: artifact `lima_dri_qemu` with libgallium_dri.so + sha256.txt + info.txt.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout (this repo)
+        uses: actions/checkout@v4
+
+      - name: Enable multi-arch binfmt (qemu-user-static)
+        run: |
+          docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+
+      - name: Build (armhf focal container)
+        run: |
+          docker run --rm \
+            --platform linux/arm/v7 \
+            -v "$PWD":/work \
+            -w /work \
+            -e WORK=/work \
+            ubuntu:20.04 \
+            bash /work/mesa/build_qemu.sh
+          echo "--- out/ ---"
+          ls -l out || true
+
+      - name: Collect artifact
+        if: always()
+        run: |
+          ls -l out || true
+          [ -f out/libgallium_dri.so ] && cat out/info.txt || echo "no .so produced"
+
+      - name: Upload libgallium_dri.so
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lima_dri_qemu
+          path: out/*
+          if-no-files-found: warn
+          retention-days: 30
