@@ -90,6 +90,65 @@ if (new_state->event) {
 - `drm_crtc_vblank_get()` 走 `vbl_lock`，不碰 `event_lock`，在 `event_lock` 内调用
   不会自死锁（sun4i 也是这么写的）。
 
+**验证**：连续 3 轮 mpv 启动（每次启动都要做模式设置 + 首帧提交，最容易触发），
+`Got the same msc` 从**每轮 1 次降到 0 次**，`drop=0`、`vfps=30.000` 不变。
+同时 vdp2 自己的探针显示 `vbcount` 5 秒 +300、`vblanks` 同步推进，说明 vblank
+计数是活的，不是"事件不发所以不重复"。
+
+## 不要给 Xorg 开 kmsro 覆盖（实测慢 10 倍，已回退）
+
+Xorg 日志里一直有这两行：
+
+```
+(II) modeset(0): Refusing to try glamor on llvmpipe
+(EE) modeset(0): glamor initialization failed
+```
+
+原因是 Mesa 只给 llvmpipe：`histb-vdp2` 不在它的 kmsro 静态映射表里，Mesa 就
+认为 card0 没有 3D 能力。modeset 驱动看到 llvmpipe，主动拒绝开 glamor。
+
+**看起来有救**：给 X server 注入 `MESA_LOADER_DRIVER_OVERRIDE=sun4i-drm`
+（lightdm 会清掉自己的环境，所以要包一层 `xserver-command` wrapper），glamor
+**确实能起来**：
+
+```
+(II) modeset(0): glamor X acceleration enabled on Mali450
+(II) modeset(0): glamor initialized
+```
+
+**但是整个桌面会慢 10 倍**：
+
+| | 桌面 glxgears |
+|---|---|
+| 不覆盖（llvmpipe） | **127–129 FPS** |
+| 覆盖（glamor on Mali450） | **10.4 FPS** |
+
+同期 `lima: pp error irq state=201 status=40` 暴涨到 100+ 条，并且出现
+`job timeout` 4 次、`bus stop` 6 次——**lima 在 glamor 的合成负载下会卡住**，
+GPU 一旦 bus stop，上屏就阻塞，所有客户端一起卡。
+
+即使在 GPU 路径下 glxgears 显示 60.0 FPS（vsync 锁），那也只是"看起来正常"，
+真正跑起来 12 秒只有 127 帧。
+
+**结论：保持 llvmpipe。** 桌面慢是确定的，但至少稳定在 129 FPS；
+换成 glamor 是"初始化成功、实际不可用"。相关配置已全部删除：
+
+- `/usr/local/bin/Xorg-kmsro`（wrapper）
+- `/etc/lightdm/lightdm.conf.d/60-kmsro.conf`（xserver-command）
+- `/etc/X11/Xsession.d/90-kmsro`（客户端全局覆盖）
+
+### 顺带：lima 只有 GL 2.1，wiliwili 用不了
+
+| 渲染器 | OpenGL 版本 | wiliwili |
+|---|---|---|
+| lima / Mali450 | **2.1** | 启动即崩（`glfw: Failed to create window`） |
+| llvmpipe | **3.1** | 正常 |
+
+wiliwili 用的 GLFW 要 3.x，lima 只到 2.1，这是**硬限制**，不是配置问题。
+所以千万别把 `MESA_LOADER_DRIVER_OVERRIDE` 放到用户会话里——那样 wiliwili
+直接起不来。（mpv 能用是因为 `--vo=gpu` 只需要 GLES2/GL2。）
+
+
 disable 路径不会漏事件：`drm_crtc_vblank_off()` 会遍历 `vblank_event_list`，
 逐个 `list_del` + `drm_vblank_put` + `send_vblank_event`，挂起的事件会被冲掉。
 

@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""bili —— 哔哩哔哩命令行客户端 (yt-dlp 解析 + mpv 播放)
+
+用法:
+  bili                    进入菜单（热门 / 搜索 / 播放 / 下载）
+  bili BV1xx411c7mD       直接播放
+  bili https://www.bilibili.com/video/BV...   同上
+  bili -q 720 BV...       指定清晰度 (360/480/720/1080)
+  bili -d BV...           下载到 ~/Videos
+  bili --drm BV...        停桌面 + KMS 直出全屏播放（本机唯一不卡的播放方式）
+
+注意: 这台机器 X11 的每帧成本极高（软件合成 + 无 GPU 加速），
+      桌面里 mpv 只能跑到 4~10fps；--drm 直出可满帧。
+
+      --drm 有两种渲染后端，默认那个是 CPU 软转换：
+        --drm        老式 legacy modesetting，swscale 软转 RGB 直写 framebuffer，
+                     完全不走 GPU。省电，但 480p 以上就吃力。
+        --drm --gpu  --vo=gpu + --gpu-context=drm，Mali450 经 kmsro 渲染，
+                     vdp2 扫描输出。实测 480p / 720p 满帧零丢帧
+                     （30fps 视频 drop=0），1080p 掉帧约 30%，别开。
+"""
+import argparse
+import fcntl
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.parse
+
+UA = "Mozilla/5.0 (X11; Linux armv7l; rv:129.0) Gecko/20100101 Firefox/129.0"
+REF = "Referer: https://www.bilibili.com/"
+YTDLP = shutil.which("yt-dlp") or "/opt/yt-dlp/yt-dlp_linux_armv7l"
+MPV = shutil.which("mpv") or "/usr/bin/mpv"
+FIREFOX_GLOB = "/home/ubuntu/.mozilla/firefox"
+
+C_OK, C_DIM, C_HI, C_OFF = "\033[32m", "\033[2m", "\033[1;36m", "\033[0m"
+
+
+def sh(cmd, timeout=30, text=True):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except Exception:
+        return ""
+
+
+def cookies():
+    """从 Firefox 配置里取 bilibili cookie（搜索接口没有 buvid3 会 412）。"""
+    try:
+        prof = None
+        for d in sorted(os.listdir(FIREFOX_GLOB)):
+            if d.endswith(".default-release"):
+                prof = os.path.join(FIREFOX_GLOB, d)
+        if not prof:
+            return ""
+        db = os.path.join(prof, "cookies.sqlite")
+        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=3)
+        rows = con.execute(
+            "select name, value from moz_cookies where host like '%bilibili%'").fetchall()
+        con.close()
+        return "; ".join("%s=%s" % (k, v) for k, v in rows)
+    except Exception:
+        return ""
+
+
+def api(path, with_cookie=False):
+    url = "https://api.bilibili.com" + path
+    cmd = ["curl", "-s", "-m", "20", "-A", UA, "-H", REF]
+    if with_cookie:
+        ck = cookies()
+        if ck:
+            cmd += ["-H", "Cookie: " + ck]
+    cmd.append(url)
+    try:
+        return json.loads(sh(cmd, 25))
+    except Exception:
+        return {}
+
+
+def secs(d):
+    if isinstance(d, int):
+        t = d
+    else:
+        parts = [int(x) for x in str(d).split(":") if x.isdigit()]
+        t = 0
+        for p in parts:
+            t = t * 60 + p
+    if t >= 3600:
+        return "%d:%02d:%02d" % (t // 3600, t % 3600 // 60, t % 60)
+    return "%d:%02d" % (t // 60, t % 60)
+
+
+def strip_tags(s):
+    return re.sub(r"<[^>]+>", "", s or "")
+
+
+def show(items, title):
+    print("\n%s== %s ==%s" % (C_HI, title, C_OFF))
+    for i, (bv, t, up, dur, play) in enumerate(items, 1):
+        print("%s%2d%s. %-52s %s %8s  %s%s" % (
+            C_HI, i, C_OFF, t[:52], C_DIM, secs(dur), up[:14], C_OFF))
+    print()
+
+
+def fetch_popular(n=20):
+    d = api("/x/web-interface/popular?ps=%d&pn=1" % n)
+    out = []
+    for e in (d.get("data") or {}).get("list", []):
+        out.append((e.get("bvid"), e.get("title", ""), (e.get("owner") or {}).get("name", ""),
+                    e.get("duration", 0), e.get("stat", {}).get("view", 0)))
+    return out
+
+
+def fetch_search(kw, n=20):
+    d = api("/x/web-interface/search/type?search_type=video&keyword=%s&page=1"
+            % urllib.parse.quote(kw), with_cookie=True)
+    if d.get("code") != 0:
+        print("搜索失败：%s（接口风控，稍后再试；热门列表不受影响）" % d.get("message", "无返回"))
+        return []
+    out = []
+    for e in (d.get("data") or {}).get("result") or []:
+        out.append((e.get("bvid"), strip_tags(e.get("title")), e.get("author", ""),
+                    e.get("duration", "0:00"), e.get("play", 0)))
+    return out[:n]
+
+
+URLCACHE = os.path.expanduser("~/.cache/bili/urls.json")
+URLCACHE_TTL = 900        # 秒。B 站直链本身约 2 小时有效，但 mcdn 节点会先失效
+FRESH = False             # --fresh：无视缓存强制重新解析
+
+
+def cache_load():
+    try:
+        with open(URLCACHE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def cache_save(d):
+    try:
+        os.makedirs(os.path.dirname(URLCACHE), exist_ok=True)
+        with open(URLCACHE, "w") as f:
+            json.dump(d, f)
+    except Exception:
+        pass
+
+
+def resolve(target, height):
+    """返回 [(视频地址, 音频地址)]
+
+    解析一次要 9~13 秒（yt-dlp 起步 + CDN 协商），短期内重复看同一个视频
+    完全没必要重来，所以直链缓存 15 分钟。过期或取不到就走原路。
+    """
+    key = "%s@%d" % (target, height)
+    cache = cache_load()
+    ent = cache.get(key) or {}
+    urls = ent.get("u") or []
+    age = time.time() - ent.get("t", 0)
+    if not FRESH and urls and age < URLCACHE_TTL and all(u.startswith("http") for u in urls):
+        print("直链缓存命中（%d 分钟前解析，跳过 yt-dlp）" % int(age / 60))
+        return urls
+
+    fmt = ("bv*[height<=%d][vcodec^=avc1]+ba/b[height<=%d]/bv*+ba/b" % (height, height))
+    p = subprocess.run([YTDLP, "-g", "-f", fmt, "--no-warnings", target],
+                       capture_output=True, text=True, timeout=120)
+    urls = [u for u in p.stdout.strip().splitlines() if u.startswith("http")]
+    if not urls:
+        print("解析失败：%s" % (p.stderr.strip()[-300:] or "没有拿到播放地址"))
+        return []
+
+    # 只留最近 20 条，别让缓存文件无限长
+    cache[key] = {"t": time.time(), "u": urls}
+    if len(cache) > 20:
+        for k in sorted(cache, key=lambda k: cache[k].get("t", 0))[:-20]:
+            cache.pop(k, None)
+    cache_save(cache)
+    return urls
+
+
+def mpv_args(urls, height, drm, gpu=False):
+    args = [MPV, "--no-config", "--hwdec=no", "--http-header-fields=" + REF,
+            "--cache=yes", "--cache-secs=30", "--demuxer-max-bytes=64MiB",
+            "--force-window=yes", "--osc=no"]
+    if drm and gpu:
+        # --vo=gpu + --gpu-context=drm 才是真 GPU 渲染（Mali450 经 kmsro）；
+        # --vo=drm 在 mpv 0.32 里是 CPU 软转换直写 framebuffer，不走 GPU。
+        args += ["--vo=gpu", "--gpu-context=drm", "--fs", "--no-osc",
+                 "--term-status-msg="]
+    elif drm:
+        args += ["--vo=drm", "--fs", "--really-quiet",
+                 "--term-status-msg="]           # 直出时界面全黑，别刷屏
+    else:
+        args += ["--vo=x11", "--geometry=100%", "--really-quiet=no"]
+    args.append(urls[0])
+    if len(urls) > 1:
+        args.append("--audio-file=%s" % urls[1])
+    return args
+
+
+def current_vt():
+    try:
+        s = open("/sys/class/tty/tty0/active").read().strip()
+        return int(s[3:])
+    except Exception:
+        return 7
+
+
+def switch_vt(n):
+    """切到第 n 个虚拟终端；需要 root（/dev/tty0）。失败返回 False。"""
+    try:
+        fd = os.open("/dev/tty0", os.O_RDWR)
+        fcntl.ioctl(fd, 0x5606, n)   # VT_ACTIVATE
+        fcntl.ioctl(fd, 0x5607, n)   # VT_WAITACTIVE
+        os.close(fd)
+        return True
+    except Exception:
+        return False
+
+
+def play_drm(urls, height, keep_desktop, gpu=False):
+    """切到空闲 VT，用 KMS 直出全屏播放，退出后切回桌面 VT。
+
+    X 一直占着 DRM master，但切走 VT 时它会主动 drop，所以不必关 lightdm。
+    mpv 的 stdin 接到目标 VT 上，这样键盘（空格暂停、q 退出、方向键快进）在
+    黑屏全屏时依然可用。
+    """
+    origin = current_vt()
+    target = 2 if origin != 2 else 3
+    moved = switch_vt(target)
+    if not moved:
+        print("没有权限切 VT（需要 root），改为临时关闭桌面…")
+        subprocess.run(["systemctl", "stop", "lightdm"], capture_output=True)
+        time.sleep(2)
+    args = mpv_args(urls, height, True, gpu)
+    if gpu:
+        # Mesa 靠驱动名做 kmsro 静态映射；histb-vdp2 不在表里，
+        # 覆盖成 sun4i-drm 即可让 Mesa 用 lima 渲染、vdp2 扫描输出。
+        os.environ["MESA_LOADER_DRIVER_OVERRIDE"] = "sun4i-drm"
+    tty_fd = None
+    try:
+        if moved:
+            try:
+                tty_fd = os.open("/dev/tty%d" % target, os.O_RDWR | os.O_NOCTTY)
+                os.dup2(tty_fd, 0)
+                os.dup2(tty_fd, 1)
+                os.dup2(tty_fd, 2)
+            except Exception:
+                tty_fd = None
+        return subprocess.run(args).returncode
+    finally:
+        if moved:
+            switch_vt(origin)
+        elif not keep_desktop:
+            subprocess.run(["systemctl", "start", "lightdm"], capture_output=True)
+            print("桌面已恢复。")
+
+
+def play(target, height, drm, keep_desktop, gpu=False):
+    urls = resolve(target, height)
+    if not urls:
+        return 1
+    if drm:
+        return play_drm(urls, height, keep_desktop, gpu)
+    return subprocess.run(mpv_args(urls, height, False)).returncode
+
+
+def download(target, height, outdir):
+    os.makedirs(outdir, exist_ok=True)
+    fmt = "bv*[height<=%d][vcodec^=avc1]+ba/b[height<=%d]/b" % (height, height)
+    return subprocess.run([YTDLP, "-f", fmt, "--merge-output-format", "mp4",
+                           "-o", os.path.join(outdir, "%(title)s [%(id)s].%(ext)s"), target]).returncode
+
+
+def menu(height, drm, gpu=False):
+    if not sys.stdin.isatty():
+        print(__doc__)
+        return 0
+    items = []
+    while True:
+        if not items:
+            print("拉取热门…")
+            items = fetch_popular(20)
+            show(items, "B站热门")
+        cmd = input("序号播放 ｜ /关键词 搜索 ｜ bv号/链接 播放 ｜ d序号 下载 ｜ q 退出\n> ").strip()
+        if not cmd:
+            continue
+        if cmd in ("q", "quit", "exit"):
+            return 0
+        if cmd.startswith("/"):
+            items = fetch_search(cmd[1:].strip(), 20)
+            if items:
+                show(items, "搜索：" + cmd[1:].strip())
+            else:
+                items = []
+            continue
+        m = re.match(r"^d\s*(\d+)$", cmd)
+        if m and items:
+            i = int(m.group(1)) - 1
+            if 0 <= i < len(items):
+                download("https://www.bilibili.com/video/" + items[i][0], height,
+                         os.path.expanduser("~/Videos"))
+            continue
+        if cmd.isdigit() and items:
+            i = int(cmd) - 1
+            if 0 <= i < len(items):
+                play("https://www.bilibili.com/video/" + items[i][0], height, drm, False, gpu)
+            continue
+        play(normalize(cmd), height, drm, False, gpu)
+
+
+def normalize(s):
+    m = re.search(r"(BV[0-9A-Za-z]{10})", s)
+    if m:
+        return "https://www.bilibili.com/video/" + m.group(1)
+    m = re.search(r"av(\d+)", s, re.I)
+    if m:
+        return "https://www.bilibili.com/video/av" + m.group(1)
+    return s
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True, description="B站命令行客户端 (yt-dlp + mpv)")
+    ap.add_argument("target", nargs="?", help="BV 号 / av 号 / 链接")
+    ap.add_argument("-q", "--quality", default="720",
+                    help="清晰度上限：360/480/720/1080（默认 720；实测 1080p 掉帧 ~30%%，"
+                         "720p 是满帧上限）")
+    ap.add_argument("-d", "--download", action="store_true", help="下载而不是播放")
+    ap.add_argument("-o", "--outdir", default=os.path.expanduser("~/Videos"))
+    ap.add_argument("--drm", action="store_true", help="KMS 直出全屏播放（关桌面，满帧）")
+    ap.add_argument("--keep-desktop", action="store_true", help="--drm 退出后不自动开桌面")
+    ap.add_argument("--gpu", action="store_true",
+                    help="--drm 时用 Mali450(lima) 渲染，而不是 CPU 软转换直写")
+    ap.add_argument("--fresh", action="store_true",
+                    help="无视直链缓存，强制重新解析（缓存命中的直链若已过期用这个）")
+    a = ap.parse_args()
+    global FRESH
+    FRESH = a.fresh
+    h = int(str(a.quality).replace("p", ""))
+    if not a.target:
+        return menu(h, a.drm, a.gpu)
+    t = normalize(a.target)
+    return download(t, h, a.outdir) if a.download else play(t, h, a.drm, a.keep_desktop, a.gpu)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
