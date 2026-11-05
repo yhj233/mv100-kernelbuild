@@ -22,13 +22,12 @@
 /* ---- mv100 debug: PP 出错瞬间的硬件寄存器（必须在复位之前读）---- */
 static int mv100_hw_dumps;
 
-static void lima_pp_dump_u32(struct lima_device *dev, const char *tag,
-			     const u32 *p, int n);
-
+/* 注意：本内核上 pr_cont() 接不上 dev_err() 的半行，必须整行拼好再打 */
 static void lima_pp_dump_dlbu_mem(struct lima_device *dev, struct lima_ip *ip)
 {
 	u32 cur = pp_read(LIMA_PP_CURRENT_REND_LIST_ADDR);
 	u32 off;
+	char line[256];
 	int i, j;
 
 	if (!dev->dlbu_cpu)
@@ -55,10 +54,11 @@ static void lima_pp_dump_dlbu_mem(struct lima_device *dev, struct lima_ip *ip)
 
 	dev_err(dev->dev, "  dlbu_mem @+%03x (cur_list=%08x):\n", off, cur);
 	for (i = 0; i < 32; i += 8) {
-		dev_err(dev->dev, "   +%03x:", off + i * 4);
+		snprintf(line, sizeof(line), "   +%03x:", off + i * 4);
 		for (j = 0; j < 8; j++)
-			pr_cont(" %08x", dev->dlbu_cpu[(off >> 2) + i + j]);
-		pr_cont("\n");
+			snprintf(line + strlen(line), sizeof(line) - strlen(line),
+				 " %08x", dev->dlbu_cpu[(off >> 2) + i + j]);
+		dev_err(dev->dev, "%s\n", line);
 	}
 }
 
@@ -514,15 +514,17 @@ static int mv100_pp_dumps;
 static void lima_pp_dump_u32(struct lima_device *dev, const char *tag,
 			     const u32 *p, int n)
 {
+	char line[256];
 	int i, j;
 
 	for (i = 0; i < n; i += 8) {
 		int m = (n - i) < 8 ? (n - i) : 8;
 
-		dev_err(dev->dev, "  %s[%02d]:", tag, i);
+		snprintf(line, sizeof(line), "  %s[%02d]:", tag, i);
 		for (j = 0; j < m; j++)
-			pr_cont(" %08x", p[i + j]);
-		pr_cont("\n");
+			snprintf(line + strlen(line), sizeof(line) - strlen(line),
+				 " %08x", p[i + j]);
+		dev_err(dev->dev, "%s\n", line);
 	}
 }
 

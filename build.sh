@@ -208,6 +208,19 @@ do_config() {
 	"${cfg[@]}" -e CGROUP_PIDS
 	"${cfg[@]}" -e FANOTIFY
 
+	# timers: this board's only clocksource is the SP804 (rating 200), and
+	# high resolution timers come out *disabled* even though
+	# multi_v7_defconfig asks for them (no hrtimer_switch_to_hres in
+	# /proc/kallsyms, and /proc/timer_list reports a 10 ms hrtimer base).
+	# With hres off and HZ=100 every nanosleep() is rounded up to a 10 ms
+	# tick, so userspace polling loops that sleep 20 us run 500x slow:
+	# Mesa's kmsro render-node discovery loops 3000 times and creating a GBM
+	# device takes 30 s instead of 60 ms.  HZ=1000 is the fallback floor if
+	# hres still refuses to arm on the SP804.
+	"${cfg[@]}" -e HIGH_RES_TIMERS
+	"${cfg[@]}" -d HZ_100
+	"${cfg[@]}" -e HZ_1000
+
 	# boot-critical plumbing.
 	# CMDLINE_PARTITION is what parses the vendor's blkdevparts= argument
 	# (upstream block/partitions/cmdline.c, __setup("blkdevparts=", ...)).
@@ -232,7 +245,7 @@ do_config() {
 	make -C "$SRC" ARCH=arm CROSS_COMPILE="$CROSS" O="$OUT" olddefconfig
 
 	step "resulting mv100 options"
-	grep -E "HISTB|HI3798MV100|HISI_FESTA|FEMAC|LIMA|APPENDED_DTB|^CONFIG_CMDLINE|^CONFIG_SOUND|^CONFIG_SND|^CONFIG_CGROUP|^CONFIG_FANOTIFY|^CONFIG_MMC_BLOCK|^CONFIG_EXT4_FS|^CONFIG_SERIAL_AMBA" \
+	grep -E "HISTB|HI3798MV100|HISI_FESTA|FEMAC|LIMA|APPENDED_DTB|^CONFIG_CMDLINE|^CONFIG_SOUND|^CONFIG_SND|^CONFIG_CGROUP|^CONFIG_FANOTIFY|^CONFIG_MMC_BLOCK|^CONFIG_EXT4_FS|^CONFIG_SERIAL_AMBA|^CONFIG_HZ|HIGH_RES_TIMERS|^CONFIG_NO_HZ" \
 		"$OUT/.config" || true
 
 	step "verifying every required option is built in"
