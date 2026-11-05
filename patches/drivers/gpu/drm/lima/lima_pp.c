@@ -21,25 +21,28 @@
 /*
  * Upstream never listens for PP_IRQ_HANG: LIMA_PP_IRQ_MASK_ERROR does not
  * contain it and LIMA_PP_IRQ_MASK_USED is built from END_OF_FRAME +
- * MASK_ERROR, so the bit is masked in PP_INT_MASK.
+ * MASK_ERROR, so the bit stays masked in PP_INT_MASK.
  *
- * On Mali450 here the PP does raise HANG when it wedges (a DLBU job leaves
- * one PP with RENDERING_ACTIVE and STATUS bit 2 set, no END_OF_FRAME ever),
- * and because the interrupt is masked the kernel notices nothing: pipe->task
- * stays above zero, the job waits out the full 10s scheduler timeout, and
- * the hard reset that finally runs is the one that sprays
- * INVALID_PLIST_COMMAND and leaves the core unusable.
+ * Measured on this Mali450 (kernel 802cdc9fde): a wedged PP does *not* raise
+ * HANG, nor any of the MASK_ERROR bits -- INT_RAWSTAT only ever carries
+ * END_OF_FRAME.  So unmasking HANG does not by itself rescue anything; it is
+ * kept because it costs nothing and it is what turns a real hang into an
+ * immediate, accurately timestamped report if the core ever does raise it.
  *
- * Unmasking HANG turns that into an immediate error interrupt, which gives
- * us both a fast recovery attempt and -- more valuable right now -- a
- * register dump taken while the PP is actually hung instead of ten seconds
- * later.
+ * What the wedge actually looks like is a *silent* PP: RENDERING_ACTIVE
+ * drops, END_OF_FRAME sits pending in INT_RAWSTAT, and PP_INT_MASK is zero,
+ * so no interrupt is ever delivered, pipe->done never gets the bit, and the
+ * job waits out the whole sched timeout on idle hardware.  See the
+ * lima_pp_hard_reset() comment for how that mask got stuck at zero.
  */
 #define LIMA_PP_IRQ_MASK_ERROR_HANG \
 	(LIMA_PP_IRQ_MASK_ERROR | LIMA_PP_IRQ_HANG)
 
 #define LIMA_PP_IRQ_MASK_USED_HANG \
 	(LIMA_PP_IRQ_END_OF_FRAME | LIMA_PP_IRQ_MASK_ERROR_HANG)
+
+/* how many broadcast read-backs to complain about before going quiet */
+static int pp_verify_left = 8;
 
 static void lima_pp_hang_dump(struct lima_ip *ip, u32 state)
 {
@@ -334,17 +337,30 @@ static int lima_pp_hard_reset(struct lima_ip *ip)
 	pp_write(LIMA_PP_CTRL, LIMA_PP_CTRL_STOP_BUS);
 	ret = lima_poll_timeout(ip, lima_pp_bus_stop_poll, 10, 100);
 	if (ret) {
-		dev_err(dev->dev, "%s bus stop timeout\n", lima_ip_name(ip));
-		return ret;
+		/*
+		 * The core reports RENDERING_ACTIVE=0 and an idle bus, yet
+		 * BUS_STOPPED never comes back.  Upstream gives up right here
+		 * and leaves PP_INT_MASK = 0 behind, i.e. the core can never
+		 * signal END_OF_FRAME again: every following job waits out the
+		 * full sched timeout with completely idle hardware, and after
+		 * that every further job does the same.  One bad frame turned
+		 * into a permanently deaf pipe.
+		 *
+		 * Do not yank FORCE_RESET on a bus that did not stop (that is
+		 * the one step that can wedge the SoC), but always put the
+		 * interrupt mask back so the core can be accounted again.
+		 */
+		dev_err(dev->dev, "%s bus stop timeout, restoring irq mask\n",
+			lima_ip_name(ip));
+		goto restore;
 	}
 
 	pp_write(LIMA_PP_CTRL, LIMA_PP_CTRL_FORCE_RESET);
 	ret = lima_poll_timeout(ip, lima_pp_hard_reset_poll, 10, 100);
-	if (ret) {
+	if (ret)
 		dev_err(dev->dev, "%s hard reset timeout\n", lima_ip_name(ip));
-		return ret;
-	}
 
+restore:
 	pp_write(LIMA_PP_PERF_CNT_0_LIMIT, 0);
 	pp_write(LIMA_PP_INT_CLEAR, LIMA_PP_IRQ_MASK_ALL);
 	pp_write(LIMA_PP_INT_MASK, LIMA_PP_IRQ_MASK_USED_HANG);
@@ -355,7 +371,7 @@ static int lima_pp_hard_reset(struct lima_ip *ip)
 	 */
 	ip->data.async_reset = false;
 
-	return 0;
+	return ret;
 }
 
 static void lima_pp_print_version(struct lima_ip *ip)
@@ -528,6 +544,39 @@ static void lima_pp_task_run(struct lima_sched_pipe *pipe,
 				pp_write(LIMA_PP_FRAME, frame->plbu_array_address[i]);
 		}
 
+		/*
+		 * DIAGNOSTIC: the whole frame is programmed through the
+		 * pp_bcast window, so if the broadcast mask is wrong the cores
+		 * simply never start -- and the symptom (idle PP, INT_MASK 0,
+		 * END_OF_FRAME pending in RAWSTAT, job timeout) looks exactly
+		 * like a hang.  Read back what the cores actually got before
+		 * handing them the start bit.
+		 */
+		if (pp_verify_left > 0) {
+			for (i = 0; i < frame->num_pp; i++) {
+				struct lima_ip *pp = pipe->processor[i];
+				u32 want = frame->use_dlbu ? LIMA_VA_RESERVE_DLBU :
+					    frame->plbu_array_address[i];
+				u32 got_frame, got_mask, got_status;
+				bool bad;
+
+				got_frame = readl(pp->iomem + LIMA_PP_FRAME);
+				got_mask = readl(pp->iomem + LIMA_PP_INT_MASK);
+				got_status = readl(pp->iomem + LIMA_PP_STATUS);
+				bad = got_frame != want ||
+				      got_mask != LIMA_PP_IRQ_MASK_USED_HANG ||
+				      (got_status & LIMA_PP_STATUS_RENDERING_ACTIVE);
+				if (!bad)
+					continue;
+
+				pp_verify_left--;
+				dev_err(dev->dev,
+					"%s precheck pp%d frame=%08x want=%08x mask=%08x status=%08x dlbu=%u\n",
+					lima_ip_name(pp), i, got_frame, want,
+					got_mask, got_status, frame->use_dlbu);
+			}
+		}
+
 		pp_write(LIMA_PP_CTRL, LIMA_PP_CTRL_START_RENDERING);
 	} else {
 		struct drm_lima_m400_pp_frame *frame = task->frame;
@@ -571,9 +620,11 @@ static void lima_pp_task_error(struct lima_sched_pipe *pipe)
 	for (i = 0; i < pipe->num_processor; i++) {
 		struct lima_ip *ip = pipe->processor[i];
 
-		dev_err(ip->dev->dev, "%s task error %d int_state=%x status=%x\n",
+		dev_err(ip->dev->dev,
+			"%s task error %d int_state=%x status=%x int_mask=%x rawstat=%x\n",
 			lima_ip_name(ip), i, pp_read(LIMA_PP_INT_STATUS),
-			pp_read(LIMA_PP_STATUS));
+			pp_read(LIMA_PP_STATUS), pp_read(LIMA_PP_INT_MASK),
+			pp_read(LIMA_PP_INT_RAWSTAT));
 
 		lima_pp_hard_reset(ip);
 	}

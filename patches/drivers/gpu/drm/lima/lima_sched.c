@@ -462,7 +462,7 @@ static void lima_hang_dump(struct lima_device *ldev,
 		 * hard reset that would restore it never ran -- PP then cannot
 		 * report completion. */
 		dev_err(ldev->dev,
-			"[hang] pp%d status=%08x rawstat=%08x intstat=%08x intmask=%08x curlist=%08x frame=%08x stack=%08x stacksz=%08x ctrl=%08x\n",
+			"[hang] pp%d status=%08x rawstat=%08x intstat=%08x intmask=%08x curlist=%08x frame=%08x stack=%08x stacksz=%08x ctrl=%08x buserr=%08x wbnd=%08x\n",
 			i, readl(m + LIMA_PP_STATUS),
 			readl(m + LIMA_PP_INT_RAWSTAT),
 			readl(m + LIMA_PP_INT_STATUS),
@@ -471,7 +471,9 @@ static void lima_hang_dump(struct lima_device *ldev,
 			readl(m + LIMA_PP_FRAME),
 			readl(m + LIMA_PP_STACK),
 			readl(m + LIMA_PP_STACK_SIZE),
-			readl(m + LIMA_PP_CTRL));
+			readl(m + LIMA_PP_CTRL),
+			readl(m + LIMA_PP_BUS_ERROR_STATUS),
+			readl(m + LIMA_PP_WRITE_BOUNDARY_LOW));
 	}
 
 	/* DLBU is what actually assigns tiles to the two PP cores on M450. */
