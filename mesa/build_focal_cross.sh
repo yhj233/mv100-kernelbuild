@@ -17,6 +17,8 @@ MESA_VER=21.2.6
 WORK="${WORK:-$PWD}"
 OUT="$WORK/out"
 CROSS=arm-linux-gnueabihf
+export DEBIAN_FRONTEND=noninteractive
+export TZ=Etc/UTC
 
 echo "=============================================================="
 echo " 0. environment"
@@ -51,6 +53,7 @@ echo "=============================================================="
 apt-get install -y -qq --no-install-recommends \
   build-essential ninja-build pkg-config python3 python3-pip \
   python3-mako python3-yaml bison flex ca-certificates curl \
+  file binutils \
   gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf \
   crossbuild-essential-armhf
 
