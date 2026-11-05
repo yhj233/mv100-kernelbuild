@@ -488,3 +488,103 @@ Got the same msc value twice ... Possibly broken driver/interlaced mode?
 
 应该改成 `drm_crtc_arm_vblank_event(crtc, new_state->event)`——排队到下一个
 vblank 再发，这也是 atomic 驱动的标准写法。**尚未修改**，等 PP 那条线定了再一起动。
+
+## lima_pp.c —— 第三个 bug：bus stop 超时后 INT_MASK 被永久留在 0（**已修**）
+
+这个和前面几个不是同一个 bug，但它是**把"一帧出错"放大成"GPU 到重启为止全废"**的
+原因，也是为什么之前每次实验看起来都像"挂死"。
+
+### 现场（run #32，`dmesg | head` 的第一条就是它，前面全是干净启动）
+
+```
+[51.470909] [hang] timeout on pipe=pp ...
+[51.470985] [hang] sched task_count=1 done=00000002 num_processor=2 error=0
+[51.471011] [hang] gp   status=00000000 rawstat=00080000 intstat=00000000   # GP 全空闲
+[51.471056] [hang] pp0  status=00000000 rawstat=00000001 intstat=00000000 intmask=00000000
+[51.471083] [hang] pp1  status=00000000 rawstat=00000000 intstat=00000000 intmask=00000000
+[51.471134] [hang] gpmmu  status=80000019 pfaddr=00000000 rawstat=00000000
+[51.471154] [hang] ppmmu0 status=80000019 pfaddr=00000000 rawstat=00000000
+[51.471265] [drm:lima_sched_timedout_job] *ERROR* pp0 job timeout
+[51.471314] lima: pp0 task error 0 int_state=0 status=0
+```
+
+三个数摆在一起是自相矛盾又自解释的：
+
+- `pp0 status=0` —— PP **没在渲染**，硬件是空的（`RENDERING_ACTIVE` 已掉）；
+- `pp0 rawstat=0x1` —— `END_OF_FRAME` 早就置起了，一直躺着没人消费；
+- `pp0 intmask=0` —— 这个 EOF **永远不会变成中断**，所以 bcast handler 永远拿不到它，
+  `pipe->done` 缺这一位，`pipe->task` 停在 1 → 干等 10s 超时。
+
+也就是说硬件其实**已经把这一帧渲染完了**，只是完成中断被自己的掩码挡死了。
+之后每 10.25s 再超时一次（93.6 / 103.8 / 114.1 / 124.4 / 134.6），每次
+`int_state=0 status=0` —— 硬件始终空闲，纯粹是软件死锁。
+
+### 成因
+
+```c
+	pp_write(LIMA_PP_CTRL, LIMA_PP_CTRL_STOP_BUS);
+	ret = lima_poll_timeout(ip, lima_pp_bus_stop_poll, 10, 100);
+	if (ret) {
+		dev_err(dev->dev, "%s bus stop timeout\n", lima_ip_name(ip));
+		return ret;          /* ← 下面恢复 INT_MASK 的代码全被跳过 */
+	}
+	...
+	pp_write(LIMA_PP_INT_CLEAR, LIMA_PP_IRQ_MASK_ALL);
+	pp_write(LIMA_PP_INT_MASK, LIMA_PP_IRQ_MASK_USED);   /* ← 永远到不了这里 */
+```
+
+进 `lima_pp_hard_reset()` 之前，`lima_pp_task_mask_irq()`（超时路径）或
+`lima_pp_handle_irq()` 的 error 分支已经把这个 PP 的 `INT_MASK` 写成 0；
+只要 `STOP_BUS` 没等到 `PP_STATUS.BUS_STOPPED`(bit4)，函数就提前返回，
+**掩码再也没有人去恢复** → 这个 PP 永久失聪。
+
+### 修法
+
+bus stop 超时不再 `return`，跳到 `restore:` 标签，无条件清 RAWSTAT 并把
+`INT_MASK` 写回 `LIMA_PP_IRQ_MASK_USED_HANG`。
+
+**没有**在总线没停的情况下硬拉 `FORCE_RESET`：那一步最可能把 AXI 总线一起锁死，
+而 `status=0` 已经说明核内没有渲染在跑，放回掩码就足够让它重新上报完成。
+宁可掉一帧，也不要变砖。
+
+### 与 HANG 假设的关系（**HANG 已证伪**）
+
+一度认为 `PP_STATUS` bit2 是"硬件自己置的 HANG 位"，而 `LIMA_PP_IRQ_HANG` 不在
+`IRQ_MASK_USED` 里，所以只要把它并进掩码就能立刻感知挂死。实测（run #32）：
+
+```
+汇总: job timeout=9  error irq=0  HANG=0  bus stop=12
+```
+
+**9 次超时，0 次 error IRQ，0 次 HANG。** 这颗 Mali450 挂死时根本不报任何错误中断，
+`INT_RAWSTAT` 里只有 `END_OF_FRAME`。掩码里加上 HANG 不解决问题（留着无害，
+若真触发能拿到准确时刻的寄存器），真正的病灶是上面那个 premature return。
+
+### 同时加的两个诊断（定位完就删）
+
+1. `lima_pp_task_run()` 里 **广播回读自检**（前 8 帧）：整个 frame 是经 `pp_bcast`
+   窗口广播下发的，如果 `BCAST_BROADCAST_MASK` 不对，PP 收不到 frame 寄存器、
+   永远不会启动，症状（PP 空闲 + INT_MASK=0 + RAWSTAT 挂 EOF + 超时）和"挂死"
+   一模一样。所以在 `START_RENDERING` 之前逐 PP 回读 `PP_FRAME`/`PP_INT_MASK`/
+   `PP_STATUS` 与期望值比对。不符会打：
+
+   ```
+   pp0 precheck pp0 frame=00000000 want=fff00000 mask=00000f1d status=00000000 dlbu=1
+   ```
+
+   顺带记一条上游 bug：`lima_bcast_mask_irq()` / `lima_bcast_reset()` 被调用时传的是
+   `pipe->bcast_processor`（= `pp_bcast`，偏移 0x16000），而这两个函数内部用的是
+   `LIMA_BCAST_*` 寄存器偏移（真 BCAST 在 0x13000）——**它们一直在写错块**。
+   `pp_bcast` 窗口的 0x00 正是 `LIMA_PP_FRAME`，所以"清广播掩码"实际是在
+   把两个 PP 的渲染地址广播成 0。目前只在错误路径上调用，暂不修。
+2. `lima_pp_task_error()` 输出补上 `int_mask` / `rawstat`；`lima_sched.c` 的
+   `[hang] pp%d` 行补上 `buserr`(`PP_BUS_ERROR_STATUS`,0x1050) / `wbnd`
+   (`LIMA_PP_WRITE_BOUNDARY_LOW`,0x1044)。
+
+### 一条方法论教训
+
+run #31 的"单 PP 实验"是**无效实验**，不能拿它否定任何假设：Mesa 的
+`lima_job.c` 固定送 `pp_frame.num_pp = screen->num_pp`（=2），而内核
+`lima_pp_task_validate()` 里有 `if (num_pp > pipe->num_processor) return -EINVAL;`
+—— 只登记 1 个 PP 时每个 PP job 都被 `-EINVAL` 挡掉，所以"无帧输出、jt 照涨"
+根本不是"单 PP 也挂"，而是 job 压根没提交。
