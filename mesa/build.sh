@@ -45,6 +45,68 @@ sudo apt-get install -y -qq --no-install-recommends \
 echo "cross sysroot: $("$CROSS-gcc" -print-sysroot)"
 echo "cross glibc max: $(strings "$("$CROSS-gcc" -print-sysroot)/lib/arm-linux-gnueabihf/libc.so.6" 2>/dev/null | grep '^GLIBC_' | sort -V | tail -1)"
 
+echo
+echo "=============================================================="
+echo " 1b. focal (glibc 2.31) armhf runtime sysroot"
+echo "=============================================================="
+# The jammy cross toolchain links against glibc 2.35 (libc6-armhf-cross), which
+# stamps GLIBC_2.32/2.33/2.34 symbol versions into the .so (pthread_* moved into
+# libc at 2.34, stat64 got bumped at 2.33).  The device is focal glibc 2.31, so
+# those symbols fail to resolve at load.  Fix: drop focal's 2.31 libc/libgcc/
+# libstdc++ into a sysroot and make the linker use THOSE instead of the jammy
+# 2.35 ones.  Symbol versions then fall back to <= 2.31.
+FOCAL="$WORK/focal-sysroot"
+mkdir -p "$FOCAL"
+P="http://ports.ubuntu.com/ubuntu-ports"
+dl() {  # dl <pool-path> <out>
+  curl -fsSL --retry 3 --retry-delay 5 -m 180 -o "$2" "$P/$1" || { echo "!! fetch $1"; return 1; }
+}
+dl "pool/main/g/glibc/libc6_2.31-0ubuntu9.18_armhf.deb"              "$FOCAL/libc6.deb"
+for d in "$FOCAL"/*.deb; do
+  echo "--- $(basename "$d") ---"
+  dpkg-deb -x "$d" "$FOCAL/root"
+done
+FOCAL_LIB="$FOCAL/root/lib/arm-linux-gnueabihf"
+ls -l "$FOCAL_LIB"/libc.so.6 "$FOCAL_LIB"/ld-linux-armhf.so.3
+echo "focal libc max: $(strings "$FOCAL_LIB/libc.so.6" | grep '^GLIBC_' | sort -V | tail -1)"
+
+# Locate the cross toolchain's armhf lib dir and back up its glibc runtime libs,
+# then overwrite them with the focal 2.31 ELF files.  This is what makes the linker
+# stamp <= 2.31 symbol versions.  We replace ONLY glibc's own runtime libs (libc/
+# libpthread/libm/libdl/librt/ld + their versioned .so files).  libgcc_s/libstdc++
+# stay on the jammy versions -- their GLIBCXX_* symbol versions are a separate
+# namespace and don't cause GLIBC_2.32+, and keeping the toolchain's own libstdc++
+# avoids any C++ ABI mismatch with g++ 11.
+CROSS_LIB="$("$CROSS-gcc" -print-file-name=libc.so.6 | xargs dirname)"
+echo "cross lib dir: $CROSS_LIB"
+mkdir -p "$FOCAL/backup"
+# glibc versioned ELF + their unversioned symlinks (libc.so.6 -> libc-2.31.so etc.)
+for f in libc-2.31.so libm-2.31.so libpthread-2.31.so libdl-2.31.so librt-2.31.so \
+         ld-2.31.so libc.so.6 libm.so.6 libpthread.so.0 libdl.so.2 librt.so.1 \
+         ld-linux-armhf.so.3 libutil-2.31.so libutil.so.1 libresolv-2.31.so libresolv.so.2 \
+         libnsl-2.31.so libnsl.so.1 libcrypt.so.1 libanl-2.31.so libanl.so.1; do
+  if [ ! -e "$FOCAL_LIB/$f" ]; then
+    continue
+  fi
+  # back up the jammy version if present
+  if [ -e "$CROSS_LIB/$f" ]; then
+    cp -a "$CROSS_LIB/$f" "$FOCAL/backup/" 2>/dev/null || true
+    rm -f "$CROSS_LIB/$f"
+  fi
+  # copy the focal file/symlink in (resolve to real content)
+  if [ -L "$FOCAL_LIB/$f" ]; then
+    # symlink: recreate it pointing at the focal versioned .so
+    target="$(readlink "$FOCAL_LIB/$f")"
+    cp -a "$FOCAL_LIB/$target" "$CROSS_LIB/$target" 2>/dev/null || true
+    ln -sf "$target" "$CROSS_LIB/$f"
+  else
+    cp -a "$FOCAL_LIB/$f" "$CROSS_LIB/$f"
+  fi
+done
+echo "--- cross libc now points at ---"
+ls -l "$CROSS_LIB"/libc.so.6 "$CROSS_LIB"/libpthread.so.0 "$CROSS_LIB"/libm.so.6 2>/dev/null
+echo "cross glibc max now: $(strings "$CROSS_LIB/libc.so.6" | grep '^GLIBC_' | sort -V | tail -1)"
+
 # armhf libraries Mesa links against.  dpkg --add-architecture lets apt pull the
 # :armhf .so/.pc side by side with the native amd64 ones.  armhf lives on
 # ports.ubuntu.com (not archive/security.ubuntu.com), so we add a dedicated
