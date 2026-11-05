@@ -163,11 +163,74 @@ disable 路径不会漏事件：`drm_crtc_vblank_off()` 会遍历 `vblank_event_
   - `_deploy/fake-drm-name/` 的 `libfake_drm_name.so`，把 card0 报的名字改成 `sun4i-drm`
   - 或者直接 `MESA_LOADER_DRIVER_OVERRIDE=sun4i-drm`（**推荐**，已实测等效）
 
-## lima_pp.c —— 已删除
+## lima_pp.c —— 曾经的 dump 补丁（已删除，现在换成真正的修复）
 
-原来是 PP 报错时的现场 dump 补丁，用来查 `job timeout`。结论是**那次排查的
-方向错了**，补丁只剩日志噪音，已经从 `patches/` 删掉（`build.sh` 不再覆盖，
-`lima_pp.c` 回到上游原样）。这一段留作复盘，见下面"已被证伪的一轮"。
+原来这里放的是 PP 报错时的现场 dump 补丁，用来查 `job timeout`。那一轮排查的
+方向错了，补丁只剩日志噪音，从 `patches/` 删掉了一段时间。
+
+**现在 `patches/drivers/gpu/drm/lima/lima_pp.c` 又回来了**，但内容完全不同：
+是"M450 上 `pipe->task` 被重复递减"的真正修复，见上面那一节。
+
+## lima_pp.c —— 修 M450 上 pipe->task 被重复递减（**真根因**）
+
+### 症状链（实测抓到的第一次失败）
+
+```
+[   42.654762] lima f9200000.gpu: pp0 error irq state=201 status=40
+[   42.654824] lima f9200000.gpu: pp1 error irq state=201 status=40
+[   42.654950] lima f9200000.gpu: [hang] sched task_count=-3 done=00000003 error=1
+...
+[   53.725898] lima f9200000.gpu: pp0 status=00000005 rawstat=00000004 intstat=00000000
+```
+
+- `state=0x201` = `END_OF_FRAME | INVALID_PLIST_COMMAND`
+- `status=0x40` = bit6（PP 内部错误状态位，lima 没定义名字）
+- **两个 PP 在 62µs 内报同一组状态** → 不是竞争，是同一帧的 plist 内容坏了
+- `task_count=-3` 而 `done=0x3` → 这个任务的计数器被递减了 **5 次**，而
+  `num_pp` 只有 2
+- 之后 PP 进 `status=0x5`（`RENDERING_ACTIVE|BUS_STOPPED`）+ `rawstat=0x4`
+  （`LIMA_PP_IRQ_HANG`，**不在 `IRQ_MASK_USED` 里，所以根本没有中断**）→
+  调度器干等 10s 超时 → `STOP_BUS` 再也停不住 → 只能重启
+
+### 根因
+
+IRQ35 是共享的，pp0/pp1/pp_bcast **三个 handler 挂在同一条中断上**，
+注册顺序（`enum lima_ip_id`）是 pp0 → pp1 → pp_bcast。
+
+M450 上每个 PP 的完成中断会在同一次 IRQ 里被**两个 handler 各减一次**：
+
+1. `lima_pp_irq_handler()`（pp0/pp1 各一个）读到 `INT_STATUS != 0` → `dec`
+2. `lima_pp_bcast_irq_handler()` —— 此时状态已被上一步 `INT_CLEAR` 清掉，
+   走 `else` 分支，PP 已不在 `RENDERING_ACTIVE` → `pipe->done |= 1<<i` → 再 `dec`
+
+于是 `pipe->task = 2` 在**第一个 PP 完成时**就归零 →
+`lima_sched_pipe_task_done()` → fence 提前 signal → 调度器立刻提交下一帧，
+而第二个 PP 还在读上一帧的 plist。GP 为新帧重建 plist 堆，PP 读到的就是
+垃圾 → `INVALID_PLIST_COMMAND`。
+
+也解释了为什么**单客户端 60 FPS 稳定、两路负载几十秒必挂**：两个 PP 平时
+几乎同时完成，提前一点看不出来；有负载时 PP1 会落后，落后就炸。
+
+### 修法
+
+**M450 上只让 bcast handler 记账。** 它本来就有 `pipe->done` 位图和
+"轮询 `PP_STATUS` 判断完成"的兜底逻辑，是天然的所有者；per-PP handler
+只负责 ack 中断。M400（无 bcast）保持原来的行为。
+
+另外给 bcast 的 `dec` 加了 `atomic_read(&pipe->task) > 0` 的护栏，
+防止迟到的完成中断把计数减成负数、从而让**下一个**任务被陈旧中断提前完成。
+
+### 相关寄存器/结构事实
+
+- `LIMA_PP_IRQ_MASK_USED = END_OF_FRAME | MASK_ERROR`，**不含 `HANG`(bit2)**
+  → PP 真挂住时 `rawstat` 有 bit2 但 `intstat` 永远是 0，内核完全无感
+- `enum lima_ip_id` 里有两个 bcast：`lima_ip_bcast`（`BROADCAST_MASK` 0x0 /
+  `INTERRUPT_MASK` 0x4，控制哪些 PP 的中断汇入 bcast 线）和
+  `lima_ip_pp_bcast`（PP 寄存器块 0x1000 段，做 soft reset 的载体）。
+  `lima_pp_soft_reset_async()` 写的是后者的 `PP_INT_MASK`，不会误伤前者。
+- `lima_bcast_enable()` 每个 job 只改 `BROADCAST_MASK` 低 16 位（广播
+  `START_RENDERING` 的 PP 掩码），`INTERRUPT_MASK` 自 init 起就没再动过
+  → bcast 中断线一直是活的，可以放心让它独占计数
 
 ## lima_sched.c —— job timeout 时 dump GP/PP/MMU（**临时诊断补丁**）
 
