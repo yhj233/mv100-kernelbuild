@@ -346,13 +346,14 @@ void lima_pp_done_timer_arm(struct lima_sched_pipe *pipe)
 void lima_pp_done_timer_disarm(struct lima_sched_pipe *pipe)
 {
 	/*
-	 * del_timer(), not del_timer_sync(): this is also called from the timer
-	 * callback itself (via lima_sched_pipe_task_done) and del_timer_sync on
-	 * the running timer would self-deadlock.  The re-arm guard checks
-	 * current_task && task>0, so after the job is accounted the timer will
-	 * not re-arm; lima_pp_pipe_fini() does the synchronous teardown.
+	 * timer_delete(), not timer_delete_sync(): this is also called from the
+	 * timer callback itself (via lima_sched_pipe_task_done) and
+	 * timer_delete_sync on the running timer would self-deadlock.  The
+	 * re-arm guard checks current_task && task>0, so after the job is
+	 * accounted the timer will not re-arm; lima_pp_pipe_fini() does the
+	 * synchronous teardown.
 	 */
-	del_timer(&pipe->done_timer);
+	timer_delete(&pipe->done_timer);
 }
 
 static void lima_pp_soft_reset_async(struct lima_ip *ip)
@@ -807,7 +808,7 @@ void lima_pp_pipe_fini(struct lima_device *dev)
 	struct lima_sched_pipe *pipe = dev->pipe + lima_pipe_pp;
 
 	/* [LOCAL] completion watchdog */
-	del_timer_sync(&pipe->done_timer);
+	timer_delete_sync(&pipe->done_timer);
 
 	if (!--lima_pp_task_slab_refcnt) {
 		kmem_cache_destroy(lima_pp_task_slab);
