@@ -1,0 +1,46 @@
+--- a/src/gallium/drivers/lima/lima_job.c
++++ b/src/gallium/drivers/lima/lima_job.c
+@@ -728,6 +728,33 @@
+           dr->maxy == job->fb.height;
+ }
+ 
++/*
++ * Force every job through the PP stream path, including fullscreen ones.
++ *
++ * Mesa assumes "Mali450 doesn't need full PP stream" and leaves
++ * ctx->pp_stream.map NULL when the damage covers the whole framebuffer,
++ * which makes the kernel hand the PP cores a DLBU descriptor instead.  On
++ * this Hi3798MV100 / Mali450 the DLBU path wedges the PPs: a job of *any*
++ * size (a 16x32 surface was enough) leaves one PP with RENDERING_ACTIVE
++ * plus an undocumented STATUS bit set, never raises END_OF_FRAME, and the
++ * core cannot be bus-stopped afterwards.  The PP stream path never did
++ * that, not even with the same 3600-tile fullscreen workload.
++ *
++ * Keep it behind LIMA_FORCE_PP_STREAM=1 so a single build can A/B test.
++ */
++static bool
++lima_force_pp_stream(void)
++{
++   static int force = -1;
++
++   if (force < 0) {
++      const char *s = getenv("LIMA_FORCE_PP_STREAM");
++      force = (s && *s && atoi(s) != 0) ? 1 : 0;
++   }
++
++   return force == 1;
++}
++
+ static void
+ lima_update_pp_stream(struct lima_job *job)
+ {
+@@ -735,7 +762,8 @@
+    struct lima_screen *screen = lima_screen(ctx->base.screen);
+    struct lima_damage_region *damage = lima_job_get_damage(job);
+    if ((screen->gpu_type == DRM_LIMA_PARAM_GPU_ID_MALI400) ||
+-       (damage && damage->region) || !lima_damage_fullscreen(job))
++       (damage && damage->region) || !lima_damage_fullscreen(job) ||
++       lima_force_pp_stream())
+       lima_update_damage_pp_stream(job);
+    else
+       /* Mali450 doesn't need full PP stream */

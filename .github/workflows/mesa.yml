@@ -1,0 +1,67 @@
+name: build mesa lima_dri.so
+
+# Builds Mesa 21.2.6's src/gallium/drivers/lima driver as a drop-in
+# replacement for /usr/lib/arm-linux-gnueabihf/dri/lima_dri.so on the
+# Hi3798MV100 box (Ubuntu 20.04 armhf, mesa 21.2.6-0ubuntu0.1~20.04.2).
+#
+# The build runs inside an armhf Ubuntu 20.04 container under qemu-user so
+# the resulting .so has exactly the same glibc / libdrm / libglapi ABI as the
+# distro package it replaces.  A cross toolchain from a 24.04 runner would
+# emit GLIBC_2.38+ symbols that focal cannot resolve.
+#
+# Output: artifact `lima_dri` with lima_dri.so + sha256.txt + info.txt.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - 'mesa/**'
+      - '.github/workflows/mesa.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+
+    steps:
+      - name: Checkout (this repo)
+        uses: actions/checkout@v4
+
+      - name: Enable arm32 emulation
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+
+      - name: Show qemu / docker
+        run: |
+          docker version --format '{{.Server.Version}}'
+          ls /proc/sys/fs/binfmt_misc/ | head -20
+
+      - name: Build inside ubuntu:20.04 armhf
+        run: |
+          set -x
+          rm -rf out && mkdir -p out
+          docker run --rm \
+            --platform linux/arm/v7 \
+            -v "$PWD":/work \
+            -w /work \
+            ubuntu:20.04 \
+            bash /work/mesa/build.sh
+          echo "--- host view of out/ ---"
+          ls -l out || true
+
+      - name: Collect artifact
+        if: always()
+        run: |
+          ls -l out || true
+          [ -f out/lima_dri.so ] && cat out/info.txt || echo "no .so produced"
+
+      - name: Upload lima_dri.so
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lima_dri
+          path: out/*
+          if-no-files-found: warn
+          retention-days: 30
