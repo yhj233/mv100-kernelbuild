@@ -43,7 +43,7 @@ echo " 2. build dependencies"
 echo "=============================================================="
 apt-get install -y -qq --no-install-recommends \
   build-essential ninja-build pkg-config python3 python3-pip \
-  python3-mako python3-yaml \
+  python3-mako python3-yaml bison flex \
   libdrm-dev libexpat1-dev zlib1g-dev libzstd-dev \
   libx11-dev libxext-dev libxfixes-dev libx11-xcb-dev \
   libxcb1-dev libxcb-dri2-0-dev libxcb-dri3-dev libxcb-present-dev \
@@ -52,7 +52,7 @@ apt-get install -y -qq --no-install-recommends \
   ca-certificates curl xz-utils file
 echo "--- installed ---"
 dpkg-query -W -f='${Package} ${Version}\n' \
-  libdrm-dev libx11-dev build-essential ninja-build 2>/dev/null
+  libdrm-dev libx11-dev build-essential ninja-build bison flex 2>/dev/null
 
 echo
 echo "=============================================================="
