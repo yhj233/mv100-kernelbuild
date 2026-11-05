@@ -59,6 +59,10 @@ apt-get install -y -qq --no-install-recommends \
   gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf \
   crossbuild-essential-armhf
 
+# meson needed EARLY (libdrm cross-build in step 3b uses it before step 4)
+pip3 install --quiet --no-cache-dir "meson==0.63.3" || apt-get install -y -qq meson
+echo "meson: $(meson --version)"
+
 "$CROSS-gcc" --version | head -1
 echo "cross sysroot: $("$CROSS-gcc" -print-sysroot)"
 # The cross toolchain ships its own focal glibc 2.31 sysroot under
@@ -145,11 +149,16 @@ esac
 echo "libdrm source root: $(pwd)"
 test -f meson.build && echo "meson.build present" || { echo "!! libdrm tree broken"; ls -la | head -20; exit 1; }
 
-# Install libdrm directly INTO the cross toolchain's sysroot so its headers,
-# .so and libdrm.pc land exactly where the cross gcc + pkg-config already look.
-# This eliminates any stage-dir prefix mismatch for mesa's meson build.
-SYSROOT=$("$CROSS-gcc" -print-sysroot)
-echo "cross sysroot: $SYSROOT"
+# Install libdrm INTO the focal multiarch tree (--prefix=/usr --libdir=lib/arm-linux-gnueabihf
+# with DESTDIR=/), so it lands exactly where the cross gcc and pkg-config already look:
+#   headers -> /usr/include/libdrm/  (new drmGetDeviceFromDevId decl)
+#   lib     -> /usr/lib/arm-linux-gnueabihf/libdrm.so.2.4.0
+#   .pc     -> /usr/lib/arm-linux-gnueabihf/pkgconfig/libdrm.pc  (Version 2.4.109)
+# This OVERWRITES focal's 2.4.107 dev headers/lib inside the build container only;
+# the device keeps 2.4.107 until we separately ship libdrm.so.2.4.0 in out/.
+# NOTE: gcc-arm-linux-gnueabihf reports -print-sysroot = "/", its real sysroot is the
+# multiarch tree /usr/lib/arm-linux-gnueabihf + /usr/include, so we install straight
+# into / with the multiarch libdir.
 
 cat > /tmp/libdrm-cross.txt <<EOF
 [binaries]
@@ -157,9 +166,6 @@ c = '${CROSS}-gcc'
 ar = '${CROSS}-ar'
 strip = '${CROSS}-strip'
 pkgconfig = 'pkg-config'
-
-[properties]
-sys_root = '$SYSROOT'
 
 [host_machine]
 system = 'linux'
@@ -174,13 +180,14 @@ meson setup _build --cross-file /tmp/libdrm-cross.txt \
   -Dvc4=false -Detnaviv=false -Dman-pages=false \
   -Dvalgrind=false -Dcairo-tests=false -Dinstall-test-programs=false
 ninja -C _build -j"$(nproc)"
-DESTDIR="$SYSROOT" ninja -C _build install
-# verify the headers + libdrm.pc landed in the sysroot
-echo "--- sysroot libdrm.h ---"
-ls -l "$SYSROOT/usr/include/libdrm/" 2>/dev/null | head
-echo "--- sysroot libdrm.pc ---"
-find "$SYSROOT" -name 'libdrm.pc' 2>/dev/null | head
-grep '^Version:' "$(find "$SYSROOT" -name 'libdrm.pc' | head -1)" 2>/dev/null || echo "!! libdrm.pc not found in sysroot"
+DESTDIR=/ ninja -C _build install
+# verify the headers + libdrm.pc landed
+echo "--- /usr/include/libdrm/xf86drm.h (should have drmGetDeviceFromDevId) ---"
+grep -c 'drmGetDeviceFromDevId' /usr/include/libdrm/xf86drm.h 2>/dev/null || echo "!! header missing"
+echo "--- /usr/lib/arm-linux-gnueabihf/pkgconfig/libdrm.pc ---"
+grep '^Version:' /usr/lib/arm-linux-gnueabihf/pkgconfig/libdrm.pc 2>/dev/null || echo "!! libdrm.pc missing"
+echo "--- libdrm.so ---"
+ls -l /usr/lib/arm-linux-gnueabihf/libdrm.so* 2>/dev/null | head
 
 echo
 echo "=============================================================="
@@ -311,7 +318,7 @@ sha256sum "$OUT/libgallium_dri.so" | tee "$OUT/sha256.txt"
 # Also export the cross-built libdrm.so.2.4.0 (soname libdrm.so.2) so the device
 # can be upgraded from 2.4.107 -> 2.4.109 (adds drmGetDeviceFromDevId, needed by
 # mesa 23.3's loader.c).  Backward compatible: soname unchanged, only new symbols.
-LIBDRM_SO=$(find "$SYSROOT" -name 'libdrm.so.2.4.0' | head -1)
+LIBDRM_SO=$(find /usr/lib/arm-linux-gnueabihf -name 'libdrm.so.2.4.0' 2>/dev/null | head -1)
 if [ -n "$LIBDRM_SO" ]; then
   cp "$LIBDRM_SO" "$OUT/libdrm.so.2.4.0"
   echo "libdrm.so.2.4.0 exported:"
@@ -319,7 +326,7 @@ if [ -n "$LIBDRM_SO" ]; then
   echo "--- libdrm NEW symbols ---"
   nm -D "$OUT/libdrm.so.2.4.0" | grep -E 'drmGetDeviceFromDevId|drmGetDevice2' || echo "(none)"
 else
-  echo "!! libdrm.so.2.4.0 not found in sysroot, skipping export"
+  echo "!! libdrm.so.2.4.0 not found, skipping export"
 fi
 
 echo "GLIBC max: $(readelf --version-info "$SO" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu | tail -1)" > "$OUT/info.txt"
