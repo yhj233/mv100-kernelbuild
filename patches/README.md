@@ -53,27 +53,37 @@ drm_crtc_vblank_off(crtc);
   从 `histb-vdp2` 改成 kmsro 认识的名字（`sun4i-drm`），Mesa 才会用 lima 渲染、
   经 DMA-BUF 交给 vdp2 扫描输出。只有 vblank 修好之后这条路才跑得动。
 
-## lima_pp.c —— PP 出错时 dump task 描述符与 GPU 命令流（**临时诊断补丁**）
+## lima_pp.c —— PP 出错时 dump 现场（**临时诊断补丁**）
 
-**目的**：lima 在 X/kmsro 负载下持续报
+**症状**：X/glamor 走 lima(kmsro) 时，一启动就刷
 
 ```
-lima f9200000.gpu: pp0/pp1 error irq state=201 status=40
-lima f9200000.gpu: pp0/pp1 task error 0/1 int_state=0 status=0
-lima f9200000.gpu: pp0/pp1 reset time out
+pp0/pp1 error irq state=201 status=40
+pp0/pp1 task error int_state=0 status=0
+pp0/pp1 bus stop timeout     -> GPU 卡在 RENDERING_ACTIVE，此后再也复位不了
 ```
 
-`state=0x201` 拆开是 `BIT(0) END_OF_FRAME | BIT(9) INVALID_PLIST_COMMAND`
-（`lima_regs.h: LIMA_PP_IRQ_INVALID_PLIST_COMMAND`）：GPU 读到的图元命令流非法。
-MMU 一条 fault 都没有，说明地址转换是通的，问题在命令流内容本身。
+`state=0x201` = `END_OF_FRAME | INVALID_PLIST_COMMAND`；
+`status=0x40` = `BUS_ERROR`（与 GP_STATUS 的 bit6 定义一致）。两者同时出现
+说明 PP 去读了不该读的地址。**注意 MMU 一条 fault 都没有**，所以不是页表缺失，
+而是 PP 拿到的地址/配置本身不对。
 
-**改动**（只加打印，不动逻辑，最多打印 3 次避免刷屏）：
+**已知线索**（第 2 版 dump 得到）：
+- 出错任务是个 26x32 的小 pixmap（`frame[10]=25, frame[11]=31`,
+  `frame[17]=supersampled_height=63`）——量级上正是 X **光标**的尺寸，
+  与「X 一启动就崩」吻合。
+- `frame[12]=fragment_stack_address=0`、`frame[13]=fragment_stack_size=0`。
+  内核 `lima_pp_task_run()` 会无条件把它们写进 `PP_STACK` / `PP_STACK_SIZE`。
+  但纯 clear 的 GBM 测试（lima_bench，369fps）同样 stack=0 却不报错，
+  所以 stack=0 本身未必致命，需要实测寄存器确认。
 
-1. `int_state` 逐位翻译成名字（不再靠十六进制猜）
-2. `task->frame` 的 23 个 PP 寄存器原值
-3. 每个 PP 的 `plbu_array_address` / `fragment_stack_address`（GPU 真正去读的 GPU VA）
-4. 拿这两个 VA 反查所属 BO（`lima_vm_get_va`），dump 那段 16 个 u32 —— 也就是
-   GPU 眼里「非法命令流」的实际内容
-5. `vm->pd.dma`、全部 BO 的 `va`/`size` 清单
+**这一版加了什么**：
+1. `lima_pp_dump_hw()`：在 **中断上下文、hard reset 之前** 读 PP 硬件寄存器
+   （FRAME/RSW/STACK/STACKSZ/STATUS/CUR_REND_LIST/BUS_ERR/ORIGIN_X/INT_RAW）。
+   上一版是在复位之后 dump，寄存器已被清零，拿到的值没有意义。
+2. `lima_pp_dump_task()`：work 上下文 dump task 描述符、23 个 frame 寄存器、
+   `plbu_array_address` / `fragment_stack_address`。
+3. `lima_pp_dump_va()`：把 VA 反查回所属 BO 并 dump 内容；
+   BO 未被 CPU 映射时用 `drm_gem_shmem_vmap_locked()` 临时映射。
 
 **注意**：诊断用，定位完应删除（从 `patches/` 删掉，build.sh 就不再覆盖）。

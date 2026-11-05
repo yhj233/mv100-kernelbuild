@@ -19,6 +19,32 @@
 #define pp_write(reg, data) writel(data, ip->iomem + reg)
 #define pp_read(reg) readl(ip->iomem + reg)
 
+/* ---- mv100 debug: PP 出错瞬间的硬件寄存器（必须在复位之前读）---- */
+static int mv100_hw_dumps;
+
+static void lima_pp_dump_hw(struct lima_device *dev, struct lima_ip *ip,
+			    u32 state, u32 status)
+{
+	if (mv100_hw_dumps >= 6)
+		return;
+	mv100_hw_dumps++;
+
+	dev_err(dev->dev,
+		"%s hw: state=%08x status=%08x FRAME=%08x RSW=%08x STACK=%08x STACKSZ=%08x\n",
+		lima_ip_name(ip), state, status,
+		pp_read(LIMA_PP_FRAME), pp_read(LIMA_PP_RSW),
+		pp_read(LIMA_PP_STACK), pp_read(LIMA_PP_STACK_SIZE));
+	dev_err(dev->dev,
+		"%s hw: CUR_REND_LIST=%08x BUS_ERR=%08x ORIGIN_X=%08x INT_RAW=%08x INT_MASK=%08x\n",
+		lima_ip_name(ip),
+		pp_read(LIMA_PP_CURRENT_REND_LIST_ADDR),
+		pp_read(LIMA_PP_BUS_ERROR_STATUS),
+		pp_read(LIMA_PP_ORIGIN_OFFSET_X),
+		pp_read(LIMA_PP_INT_RAWSTAT), pp_read(LIMA_PP_INT_MASK));
+}
+/* ---- end mv100 debug ---- */
+
+
 static void lima_pp_handle_irq(struct lima_ip *ip, u32 state)
 {
 	struct lima_device *dev = ip->dev;
@@ -29,6 +55,7 @@ static void lima_pp_handle_irq(struct lima_ip *ip, u32 state)
 
 		dev_err(dev->dev, "%s error irq state=%x status=%x\n",
 			lima_ip_name(ip), state, status);
+		lima_pp_dump_hw(dev, ip, state, status);
 
 		pipe->error = true;
 
@@ -422,7 +449,7 @@ static void lima_pp_task_fini(struct lima_sched_pipe *pipe)
 }
 
 
-/* ---- mv100 debug: dump task descriptor + GPU command stream on PP error ---- */
+/* ---- mv100 debug: PP 出错后 dump task 描述符与 GPU 命令流 ---- */
 static int mv100_pp_dumps;
 
 static void lima_pp_dump_u32(struct lima_device *dev, const char *tag,
@@ -440,7 +467,7 @@ static void lima_pp_dump_u32(struct lima_device *dev, const char *tag,
 	}
 }
 
-/* 把 GPU 侧的 VA 翻译回它所属的 BO，并 dump 那段内容 */
+/* 把 GPU 侧 VA 翻译回所属 BO，并 dump 那段内容；未映射则临时 vmap */
 static void lima_pp_dump_va(struct lima_device *dev, struct lima_sched_task *task,
 			    u32 va, const char *tag)
 {
@@ -454,14 +481,17 @@ static void lima_pp_dump_va(struct lima_device *dev, struct lima_sched_task *tas
 		struct lima_bo *bo = task->bos[i];
 		size_t size = lima_bo_size(bo);
 		u32 bo_va = lima_vm_get_va(vm, bo);
+		struct iosys_map map;
 		char *base;
 		size_t off;
 
-		if (!bo_va || va < bo_va || va >= bo_va + size)
+		if (va < bo_va || va >= bo_va + size)
 			continue;
 
 		off = (size_t)(va - bo_va) & ~3UL;
 		base = bo->base.vaddr;
+		if (!base && !drm_gem_shmem_vmap_locked(&bo->base, &map))
+			base = map.vaddr;
 		dev_err(dev->dev,
 			"  %s va=%08x -> bo[%d] va=%08x size=%zu off=%zu kva=%px\n",
 			tag, va, i, bo_va, size, off, base);
