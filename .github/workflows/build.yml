@@ -30,43 +30,37 @@ jobs:
             gcc-arm-linux-gnueabihf
           arm-linux-gnueabihf-gcc --version | head -1
 
-      # Until 2026-11-05 a plain shallow clone worked here.  It then started
-      # failing after ~0.4s with no git message at all (bash -e exits on the
-      # failing `git clone && break` list, so the loop never retried and the
-      # stderr text was lost).  Keep git clone as the first choice -- it gives
-      # the -g<hash> in the kernel release string -- but fall back to the
-      # codeload tarball, which is a single HTTPS GET and far more robust.
-      - name: Fetch kernel (histb branch)
+      # 2026-11-05T08:34Z: histb-mainline/linux force-pushed its `histb` branch
+      # to a single "init" commit whose tree only holds README.md, so a branch
+      # clone now yields an *empty* checkout in under a second (and codeload
+      # hands back a 291-byte empty tarball).  Pin the last good commit instead
+      # -- GitHub still serves unreferenced objects by full sha.
+      - name: Fetch kernel (pinned commit)
         run: |
           set +e
+          SHA=4a102ade5e075f662f2eec1f27d829a7fd7932e1
           ok=0
           for attempt in 1 2 3; do
-            echo "===== attempt $attempt ====="
-            echo "-- git ls-remote --"
-            git ls-remote --heads https://github.com/histb-mainline/linux.git 2>&1 | head -5
-            echo "-- git clone --"
-            git clone --depth 1 -b histb \
-              https://github.com/histb-mainline/linux.git mv100-linux
-            rc=$?
-            echo "git clone rc=$rc"
-            if [ $rc -eq 0 ] && [ -f mv100-linux/Makefile ]; then ok=1; break; fi
+            echo "===== attempt $attempt ($SHA) ====="
             rm -rf mv100-linux
-
-            echo "-- tarball fallback --"
-            curl -fL --retry 3 --retry-delay 5 -o /tmp/linux.tar.gz \
-              https://codeload.github.com/histb-mainline/linux/tar.gz/refs/heads/histb
+            git init -q mv100-linux
+            git -C mv100-linux remote add origin \
+              https://github.com/histb-mainline/linux.git
+            git -C mv100-linux fetch --depth 1 --no-tags origin "$SHA"
             rc=$?
-            echo "curl rc=$rc  size=$(stat -c %s /tmp/linux.tar.gz 2>/dev/null)"
+            echo "fetch rc=$rc"
             if [ $rc -eq 0 ]; then
-              mkdir -p mv100-linux
-              tar -xzf /tmp/linux.tar.gz -C mv100-linux --strip-components=1
-              if [ -f mv100-linux/Makefile ]; then ok=1; break; fi
+              git -C mv100-linux checkout -q FETCH_HEAD
+              if [ -f mv100-linux/Makefile ] && [ -d mv100-linux/drivers/gpu/drm/histb ]; then
+                ok=1; break
+              fi
+              echo "checkout incomplete:"; ls mv100-linux | head
             fi
-            rm -rf mv100-linux; sleep 10
+            sleep 15
           done
-          [ "$ok" = 1 ] || { echo "::error::no kernel source after 3 attempts"; exit 1; }
-          test -f mv100-linux/Makefile
-          git -C mv100-linux log -1 --format='%h %ad %s' 2>/dev/null || echo "(from tarball)"
+          [ "$ok" = 1 ] || { echo "::error::cannot fetch $SHA"; exit 1; }
+          git -C mv100-linux log -1 --format='%H %ad %s'
+          head -4 mv100-linux/Makefile | tr '\n' ' '; echo
 
       - name: Build
         run: |
