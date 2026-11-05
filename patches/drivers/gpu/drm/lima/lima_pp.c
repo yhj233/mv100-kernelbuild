@@ -22,6 +22,46 @@
 /* ---- mv100 debug: PP 出错瞬间的硬件寄存器（必须在复位之前读）---- */
 static int mv100_hw_dumps;
 
+static void lima_pp_dump_u32(struct lima_device *dev, const char *tag,
+			     const u32 *p, int n);
+
+static void lima_pp_dump_dlbu_mem(struct lima_device *dev, struct lima_ip *ip)
+{
+	u32 cur = pp_read(LIMA_PP_CURRENT_REND_LIST_ADDR);
+	u32 off;
+	int i, j;
+
+	if (!dev->dlbu_cpu)
+		return;
+
+	/* DLBU 的 tile list 缓冲区被映射在 LIMA_VA_RESERVE_DLBU */
+	if (cur >= (u32)LIMA_VA_RESERVE_DLBU &&
+	    cur < (u32)LIMA_VA_RESERVE_DLBU + LIMA_PAGE_SIZE)
+		off = (cur - (u32)LIMA_VA_RESERVE_DLBU) & ~3u;
+	else if (cur >= (u32)dev->dlbu_dma &&
+		 cur < (u32)dev->dlbu_dma + LIMA_PAGE_SIZE)
+		off = (cur - (u32)dev->dlbu_dma) & ~3u;
+	else {
+		dev_err(dev->dev,
+			"  cur_list=%08x 不在 dlbu buf (va=%08x dma=%08x) 内，从头 dump\n",
+			cur, (u32)LIMA_VA_RESERVE_DLBU, (u32)dev->dlbu_dma);
+		off = 0;
+	}
+
+	/* 出错点前后各看一些，off 向前对齐到 8 字边界 */
+	off &= ~31u;
+	if (off + 128 > LIMA_PAGE_SIZE)
+		off = LIMA_PAGE_SIZE - 128;
+
+	dev_err(dev->dev, "  dlbu_mem @+%03x (cur_list=%08x):\n", off, cur);
+	for (i = 0; i < 32; i += 8) {
+		dev_err(dev->dev, "   +%03x:", off + i * 4);
+		for (j = 0; j < 8; j++)
+			pr_cont(" %08x", dev->dlbu_cpu[(off >> 2) + i + j]);
+		pr_cont("\n");
+	}
+}
+
 static void lima_pp_dump_hw(struct lima_device *dev, struct lima_ip *ip,
 			    u32 state, u32 status)
 {
@@ -41,6 +81,25 @@ static void lima_pp_dump_hw(struct lima_device *dev, struct lima_ip *ip,
 		pp_read(LIMA_PP_BUS_ERROR_STATUS),
 		pp_read(LIMA_PP_ORIGIN_OFFSET_X),
 		pp_read(LIMA_PP_INT_RAWSTAT), pp_read(LIMA_PP_INT_MASK));
+	dev_err(dev->dev, "%s hw: WBND_LOW=%08x CTRL=%08x\n",
+		lima_ip_name(ip), pp_read(LIMA_PP_WRITE_BOUNDARY_LOW),
+		pp_read(LIMA_PP_CTRL));
+
+	if (dev->dlbu_cpu) {
+		struct lima_ip *dlbu = dev->ip + lima_ip_dlbu;
+		void __iomem *dm = dlbu->iomem;
+
+		dev_err(dev->dev,
+			"dlbu hw: PHYS=%08x VADDR=%08x VBASE=%08x FBDIM=%08x CONF=%08x TILEPOS=%08x EN=%08x\n",
+			readl(dm + LIMA_DLBU_MASTER_TLLIST_PHYS_ADDR),
+			readl(dm + LIMA_DLBU_MASTER_TLLIST_VADDR),
+			readl(dm + LIMA_DLBU_TLLIST_VBASEADDR),
+			readl(dm + LIMA_DLBU_FB_DIM),
+			readl(dm + LIMA_DLBU_TLLIST_CONF),
+			readl(dm + LIMA_DLBU_START_TILE_POS),
+			readl(dm + LIMA_DLBU_PP_ENABLE_MASK));
+	}
+	lima_pp_dump_dlbu_mem(dev, ip);
 }
 /* ---- end mv100 debug ---- */
 
@@ -528,11 +587,16 @@ static void lima_pp_dump_task(struct lima_device *dev, struct lima_sched_pipe *p
 		dev_err(dev->dev, "  m450 num_pp=%u use_dlbu=%u\n",
 			f->num_pp, f->use_dlbu);
 		lima_pp_dump_u32(dev, "reg", f->frame, LIMA_PP_FRAME_REG_NUM);
+		dev_err(dev->dev, "  dlbu_regs: vbase=%08x fbdim=%08x conf=%08x tilepos=%08x\n",
+			f->dlbu_regs[0], f->dlbu_regs[1],
+			f->dlbu_regs[2], f->dlbu_regs[3]);
 		for (i = 0; i < 8; i++)
 			dev_err(dev->dev, "  pp%d plbu_va=%08x stack_va=%08x\n", i,
 				f->plbu_array_address[i], f->fragment_stack_address[i]);
-		lima_pp_dump_va(dev, task, f->plbu_array_address[0], "plbu");
-		lima_pp_dump_va(dev, task, f->fragment_stack_address[0], "stack");
+		lima_pp_dump_va(dev, task, f->plbu_array_address[0],
+				f->use_dlbu ? "tllist/plb" : "plbu");
+		if (f->fragment_stack_address[0])
+			lima_pp_dump_va(dev, task, f->fragment_stack_address[0], "stack");
 	} else {
 		struct drm_lima_m400_pp_frame *f = task->frame;
 
