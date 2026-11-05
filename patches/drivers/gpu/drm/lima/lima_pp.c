@@ -110,20 +110,27 @@ static irqreturn_t lima_pp_bcast_irq_handler(int irq, void *data)
 		} else {
 			if (status & LIMA_PP_STATUS_RENDERING_ACTIVE) {
 				/*
-				 * Diagnostic: the PP has no pending interrupt but
-				 * is still rendering, so it cannot be accounted as
-				 * done.  Seeing this means a PP is stuck active --
-				 * the scheduler will sit here until the timeout.
+				 * A PP that reported an error keeps its interrupt
+				 * masked and its RENDERING_ACTIVE bit set until the
+				 * hard reset in lima_pp_task_error(), which only
+				 * runs from the job timeout handler.  Waiting for
+				 * "not active" therefore stalls the whole pipe for
+				 * a full sched timeout (10s by default) on every
+				 * error.  Once pipe->error is set the job is going
+				 * to be reset anyway, so account this PP as done
+				 * and let the reset happen right away.
 				 */
-				if (lima_pp_active_log < 10) {
-					lima_pp_active_log++;
-					dev_err(dev->dev,
-						"[pp] %s still active rawstat=%08x status=%08x\n",
-						lima_ip_name(ip),
-						pp_read(LIMA_PP_INT_RAWSTAT),
-						status);
+				if (!pipe->error) {
+					if (lima_pp_active_log < 10) {
+						lima_pp_active_log++;
+						dev_err(dev->dev,
+							"[pp] %s still active rawstat=%08x status=%08x\n",
+							lima_ip_name(ip),
+							pp_read(LIMA_PP_INT_RAWSTAT),
+							status);
+					}
+					continue;
 				}
-				continue;
 			}
 		}
 

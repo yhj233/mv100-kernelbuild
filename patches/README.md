@@ -250,6 +250,37 @@ M450 上每个 PP 的完成中断会在同一次 IRQ 里被**两个 handler 各�
   `START_RENDERING` 的 PP 掩码），`INTERRUPT_MASK` 自 init 起就没再动过
   → bcast 中断线一直是活的，可以放心让它独占计数
 
+## lima_pp.c —— 第二个 bug：PP 报错后 RENDERING_ACTIVE 永不清，白等 10s（**已修**）
+
+run #22 的 `[done]` / `[pp]` 日志把时间线钉死了：
+
+```
+39.796869  pp0 error irq state=201 status=40
+39.796931  pp1 error irq state=201 status=40
+39.797027  [pp] pp1 still active rawstat=00000000 status=00000001   <-- 只有 bit0
+   ...... 10 秒空白，PP1 一直是 RENDERING_ACTIVE、却没有任何待处理中断 ......
+49.854852  [hang] sched task_count=1 done=00000001 error=0           <-- 这才是真正的 10s 超时
+49.855911  [done] task_count=0 done=00000003 recov=0
+49.856031  [hang] sched jiffies=...929 task_count=0 done=00000003 error=1   <-- 0.12ms 后就 TDR
+```
+
+结论有两条：
+
+1. **`drm_sched_fault()` 是立即生效的**（`[done]` 到 TDR 只差 0.12ms），
+   所以"错误后干等 10s"不是 drm_sched 的问题，而是**根本走不到 `task_done`**。
+2. `lima_pp_handle_irq()` 在出错时会把该 PP 的 `INT_MASK` 清 0，
+   而 PP 出错后 `PP_STATUS.RENDERING_ACTIVE` **不会自己清**——要等
+   `lima_pp_task_error()` 里的 hard reset，而那只有超时处理里才调用。
+   于是 bcast handler 永远在 `if (status & RENDERING_ACTIVE) continue;` 打转，
+   `pipe->task` 停在 1，整整等一个 sched timeout（默认 10s）。
+
+**修法**：`pipe->error` 一旦置位就说明这个 job 注定要被 reset，
+此时不再因为 `RENDERING_ACTIVE` 而跳过，直接把它记成 done 并 dec，
+让 `task_done()` → `drm_sched_fault()` → hard reset 立刻发生。
+
+效果：**每个 PP 错误的代价从 10 秒冻结变成毫秒级重置**。
+（plist 本身为什么非法还没解决，但至少桌面不会再一卡 10 秒。）
+
 ## lima_sched.c —— job timeout 时 dump GP/PP/MMU（**临时诊断补丁**）
 
 **症状**：X/glamor 走 lima(kmsro) 时，桌面空闲完全正常（PP 错误 0），
