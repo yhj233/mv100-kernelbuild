@@ -15,6 +15,7 @@
 #include "lima_device.h"
 #include "lima_drv.h"
 #include "lima_sched.h"
+#include "lima_pp.h"
 #include "lima_vm.h"
 #include "lima_mmu.h"
 #include "lima_l2_cache.h"
@@ -565,6 +566,10 @@ static enum drm_gpu_sched_stat lima_sched_timedout_job(struct drm_sched_job *job
 	 */
 	pipe->task_mask_irq(pipe);
 
+	/* [LOCAL] completion watchdog: stop polling, the job is being reset */
+	if (pipe->bcast_processor)
+		lima_pp_done_timer_disarm(pipe);
+
 	if (lima_hang_dump_count++ < 5)
 		lima_hang_dump(ldev, pipe, task);
 
@@ -673,6 +678,10 @@ void lima_sched_pipe_task_done(struct lima_sched_pipe *pipe)
 {
 	struct lima_sched_task *task = pipe->current_task;
 	struct lima_device *ldev = pipe->ldev;
+
+	/* [LOCAL] completion watchdog: only the PP pipe arms it */
+	if (pipe->bcast_processor)
+		lima_pp_done_timer_disarm(pipe);
 
 	if (pipe->error) {
 		if (task && task->recoverable)

@@ -5,6 +5,7 @@
 #include <linux/io.h>
 #include <linux/device.h>
 #include <linux/slab.h>
+#include <linux/timer.h>
 
 #include <drm/lima_drm.h>
 
@@ -208,25 +209,42 @@ static irqreturn_t lima_pp_bcast_irq_handler(int irq, void *data)
 			continue;
 		}
 
-		if (state) {
+		/*
+		 * Error/HANG bits must be handled (and acknowledged) even when
+		 * the core has not yet dropped RENDERING_ACTIVE: they carry the
+		 * real failure report and, once raised, the job is going to be
+		 * reset anyway.  Pass the full state through so lima_pp_handle_irq
+		 * can mask + dump on HANG.
+		 */
+		if (state & (LIMA_PP_IRQ_MASK_ERROR_HANG))
 			lima_pp_handle_irq(ip, state);
+		else if (state)
+			pp_write(LIMA_PP_INT_CLEAR, state);
+		if (state)
 			ret = IRQ_HANDLED;
-		} else {
-			if (status & LIMA_PP_STATUS_RENDERING_ACTIVE) {
-				/*
-				 * A PP that reported an error keeps its interrupt
-				 * masked and its RENDERING_ACTIVE bit set until the
-				 * hard reset in lima_pp_task_error(), which only
-				 * runs from the job timeout handler.  Waiting for
-				 * "not active" therefore stalls the whole pipe for
-				 * a full sched timeout (10s by default) on every
-				 * error.  Once pipe->error is set the job is going
-				 * to be reset anyway, so account this PP as done
-				 * and let the reset happen right away.
-				 */
-				if (!pipe->error)
-					continue;
-			}
+
+		/*
+		 * The wire-ORed interrupt line (all eight Mali units share SPI 94
+		 * on this SoC) means INT_STATUS/END_OF_FRAME can be consumed by a
+		 * competing handler before we sample it, so the interrupt bit is
+		 * NOT a reliable completion signal.  RENDERING_ACTIVE, by contrast,
+		 * is pure hardware state that nothing on the shared line clears:
+		 * treat its falling edge as the authoritative "PP finished".
+		 *
+		 *   1. RENDERING_ACTIVE still set and no error: genuinely still
+		 *      drawing, wait for a later interrupt to re-run this handler.
+		 *   2. RENDERING_ACTIVE cleared: the core finished, account it done
+		 *      regardless of whether END_OF_FRAME is still pending.  This
+		 *      is the fix for the race where the END_OF_FRAME bit was
+		 *      cleared out from under us, leaving the PP idle but never
+		 *      accounted -- which is exactly the silent, periodic wedge.
+		 *   3. pipe->error already set: the job is doomed; account done so
+		 *      the timeout/reset path runs instead of stalling a full sched
+		 *      timeout on idle-but-flagged-as-active hardware.
+		 */
+		if (status & LIMA_PP_STATUS_RENDERING_ACTIVE) {
+			if (!pipe->error)
+				continue;
 		}
 
 		pipe->done |= (1 << i);
@@ -246,6 +264,95 @@ static irqreturn_t lima_pp_bcast_irq_handler(int irq, void *data)
 	}
 
 	return ret;
+}
+
+/*
+ * [LOCAL] Completion watchdog.
+ *
+ * The eight Mali units on this SoC are wire-ORed onto one GIC line (SPI 94),
+ * and the PP units share that line with gp/gpmmu/pmu.  A PP can therefore
+ * finish (RENDERING_ACTIVE drops) while its END_OF_FRAME interrupt bit is
+ * consumed by a competing shared handler before this driver samples it -- and
+ * once every pending bit on the line is cleared, no interrupt will ever
+ * re-enter this handler, so that PP is never accounted: the job idles for a
+ * whole scheduler timeout (10s) and then gets hard-reset.  That is the
+ * periodic stall seen as stale framebuffer + input lag on screen.
+ *
+ * RENDERING_ACTIVE is pure hardware state that nothing on the shared line
+ * clears, so it is the authoritative "finished" signal.  This timer polls it
+ * and folds any finished-but-unaccounted PP into pipe->done, which lets the
+ * job complete promptly instead of timing out.
+ */
+static void lima_pp_done_poll(struct lima_sched_pipe *pipe)
+{
+	struct drm_lima_m450_pp_frame *frame;
+	int i;
+
+	/*
+	 * Only meaningful for the broadcast (M450) pipe: the per-PP shared
+	 * handler there is what races for the wire-ORed END_OF_FRAME.  On
+	 * Mali400 each PP has its own interrupt and the plain irq handler
+	 * accounts it, so there is nothing to poll.
+	 */
+	if (!pipe->bcast_processor)
+		return;
+
+	if (!pipe->current_task)
+		return;
+
+	frame = pipe->current_task->frame;
+
+	for (i = 0; i < frame->num_pp; i++) {
+		struct lima_ip *ip = pipe->processor[i];
+
+		if (!ip || !ip->present)
+			continue;
+		if (pipe->done & (1 << i))
+			continue;
+
+		/* RENDERING_ACTIVE still set: genuinely drawing, leave it. */
+		if (pp_read(LIMA_PP_STATUS) & LIMA_PP_STATUS_RENDERING_ACTIVE)
+			continue;
+
+		/* finished but never accounted -- fold it in */
+		pipe->done |= (1 << i);
+
+		if (atomic_read(&pipe->task) <= 0)
+			continue;
+		if (atomic_dec_and_test(&pipe->task))
+			lima_sched_pipe_task_done(pipe);
+	}
+}
+
+static void lima_pp_done_timer_cb(struct timer_list *t)
+{
+	struct lima_sched_pipe *pipe =
+		container_of(t, struct lima_sched_pipe, done_timer);
+
+	lima_pp_done_poll(pipe);
+
+	/* keep polling until the job is fully accounted */
+	if (pipe->current_task && atomic_read(&pipe->task) > 0)
+		mod_timer(&pipe->done_timer, jiffies + msecs_to_jiffies(50));
+}
+
+void lima_pp_done_timer_arm(struct lima_sched_pipe *pipe)
+{
+	if (!pipe->bcast_processor)
+		return;
+	mod_timer(&pipe->done_timer, jiffies + msecs_to_jiffies(50));
+}
+
+void lima_pp_done_timer_disarm(struct lima_sched_pipe *pipe)
+{
+	/*
+	 * del_timer(), not del_timer_sync(): this is also called from the timer
+	 * callback itself (via lima_sched_pipe_task_done) and del_timer_sync on
+	 * the running timer would self-deadlock.  The re-arm guard checks
+	 * current_task && task>0, so after the job is accounted the timer will
+	 * not re-arm; lima_pp_pipe_fini() does the synchronous teardown.
+	 */
+	del_timer(&pipe->done_timer);
 }
 
 static void lima_pp_soft_reset_async(struct lima_ip *ip)
@@ -599,6 +706,9 @@ static void lima_pp_task_run(struct lima_sched_pipe *pipe,
 			pp_write(LIMA_PP_CTRL, LIMA_PP_CTRL_START_RENDERING);
 		}
 	}
+
+	/* [LOCAL] arm the completion watchdog now that the cores are running */
+	lima_pp_done_timer_arm(pipe);
 }
 
 static void lima_pp_task_fini(struct lima_sched_pipe *pipe)
@@ -686,11 +796,19 @@ int lima_pp_pipe_init(struct lima_device *dev)
 	pipe->task_mmu_error = lima_pp_task_mmu_error;
 	pipe->task_mask_irq = lima_pp_task_mask_irq;
 
+	/* [LOCAL] completion watchdog */
+	timer_setup(&pipe->done_timer, lima_pp_done_timer_cb, 0);
+
 	return 0;
 }
 
 void lima_pp_pipe_fini(struct lima_device *dev)
 {
+	struct lima_sched_pipe *pipe = dev->pipe + lima_pipe_pp;
+
+	/* [LOCAL] completion watchdog */
+	del_timer_sync(&pipe->done_timer);
+
 	if (!--lima_pp_task_slab_refcnt) {
 		kmem_cache_destroy(lima_pp_task_slab);
 		lima_pp_task_slab = NULL;
