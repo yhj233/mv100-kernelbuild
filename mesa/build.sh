@@ -28,6 +28,12 @@ echo
 echo "=============================================================="
 echo " 1. armhf cross toolchain + armhf dev libs"
 echo "=============================================================="
+# armhf is a "ports" architecture: its Packages index lives on ports.ubuntu.com,
+# NOT on archive/security.ubuntu.com (those only carry amd64/i386).  The default
+# jammy runner already points at archive/security.ubuntu.com for amd64 (which we
+# must keep for the native build-essential/toolchain install below).  So we add a
+# SEPARATE ports.ubuntu.com source restricted to [arch=armhf], instead of
+# rewriting the amd64 sources (ports.ubuntu.com has no amd64 -- only non-x86).
 sudo apt-get update -qq
 sudo apt-get install -y -qq --no-install-recommends \
   build-essential ninja-build pkg-config python3 python3-pip \
@@ -40,8 +46,15 @@ echo "cross sysroot: $("$CROSS-gcc" -print-sysroot)"
 echo "cross glibc max: $(strings "$("$CROSS-gcc" -print-sysroot)/lib/arm-linux-gnueabihf/libc.so.6" 2>/dev/null | grep '^GLIBC_' | sort -V | tail -1)"
 
 # armhf libraries Mesa links against.  dpkg --add-architecture lets apt pull the
-# :armhf .so/.pc side by side with the native amd64 ones.
+# :armhf .so/.pc side by side with the native amd64 ones.  armhf lives on
+# ports.ubuntu.com (not archive.ubuntu.com), so add a dedicated [arch=armhf] source.
 sudo dpkg --add-architecture armhf
+sudo tee /etc/apt/sources.list.d/armhf-ports.list >/dev/null <<'EOF'
+deb [arch=armhf] http://ports.ubuntu.com/ubuntu-ports jammy main universe
+deb [arch=armhf] http://ports.ubuntu.com/ubuntu-ports jammy-updates main universe
+deb [arch=armhf] http://ports.ubuntu.com/ubuntu-ports jammy-security main universe
+deb [arch=armhf] http://ports.ubuntu.com/ubuntu-ports jammy-backports main universe
+EOF
 sudo apt-get update -qq
 sudo apt-get install -y -qq --no-install-recommends \
   libdrm-dev:armhf \
