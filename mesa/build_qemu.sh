@@ -33,6 +33,7 @@ apt-get update -qq
 apt-get install -y -qq --no-install-recommends \
   build-essential ninja-build pkg-config python3 python3-pip \
   python3-mako python3-yaml bison flex git ca-certificates curl \
+  file binutils \
   libdrm-dev libx11-dev libxext-dev libxfixes-dev libx11-xcb-dev \
   libxcb1-dev libxcb-dri2-0-dev libxcb-dri3-dev \
   libxcb-present-dev libxcb-sync-dev libxcb-shm0-dev \
