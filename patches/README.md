@@ -169,6 +169,56 @@ disable 路径不会漏事件：`drm_crtc_vblank_off()` 会遍历 `vblank_event_
 方向错了**，补丁只剩日志噪音，已经从 `patches/` 删掉（`build.sh` 不再覆盖，
 `lima_pp.c` 回到上游原样）。这一段留作复盘，见下面"已被证伪的一轮"。
 
+## lima_sched.c —— job timeout 时 dump GP/PP/MMU（**临时诊断补丁**）
+
+**症状**：X/glamor 走 lima(kmsro) 时，桌面空闲完全正常（PP 错误 0），
+但一加负载（两路 glxgears、wiliwili）GPU 就卡死：
+
+```
+[drm:lima_sched_timedout_job] *ERROR* pp0 job timeout
+lima f9200000.gpu: pp0 bus stop timeout
+lima f9200000.gpu: pp1 bus stop timeout
+```
+
+**注意顺序**：`job timeout` 在**前**，`bus stop timeout` 在**后**。
+bus stop 是 `lima_pp_hard_reset()` 里 `STOP_BUS` 等 100ms 也没停住的结果，
+**是后果不是原因**。真正要查的是"GPU 为什么 500ms 不返回"。
+
+### 为什么打在 `lima_sched_timedout_job()`
+
+这是唯一能拿到现场的位置：`pipe->task_mask_irq(pipe)` 之后、`pipe->task_error()`
+（会 hard reset）之前 —— 中断已屏蔽但**硬件状态还没被清掉**。
+
+dump 的内容（全部走 `dev_err`，行首带 `[hang]`）：
+
+| IP | 寄存器 | 看什么 |
+|---|---|---|
+| GP | `STATUS` / `INT_RAWSTAT` / `INT_STAT` | `VS_ACTIVE`/`PLBU_ACTIVE` 卡在哪级；`BUS_ERROR`(bit6)、`WRITE_BOUND_ERR`(bit8) |
+| GP | `VSCL_START_ADDR_READ` | GP 正在执行 VS 指令流的哪个地址 |
+| GP | VS/PLBU/ALLOC 的 start-end 区间 | 命令流是否越界 |
+| PP0/1 | `CURRENT_REND_LIST_ADDR` | **PP 当前读到 plist 的哪个地址**，和 `FRAME` 一比就知道是不是跑飞 |
+| PP0/1 | `FRAME` / `STACK` / `STACK_SIZE` / `CTRL` | plist 起点、fragment stack 配置 |
+| GPMMU/PPMMU | `STATUS` / `DTE` / `PAGE_FAULT_ADDR` / `INT_RAWSTAT` | 区分"地址翻译失败"还是"PP/GP 自己卡住" |
+| task | `frame` 前 64 字节 | Mesa 实际提交的 frame 描述符 |
+
+只打前 5 次（`lima_hang_dump_count`），避免刷屏。
+
+**注意**：用 `print_hex_dump()` 而不是手写 `snprintf` 拼行 —— 7.3 把 `snprintf`
+挪到了 `linux/sprintf.h`，手写容易踩头文件问题；`pr_cont()` 也不好用（实测
+`dev_err` 之后的 `pr_cont` 接不上，只输出半行）。
+
+**诊断用，定位完应删除。**
+
+### 与之相关的结构事实（查 Mesa 21.2.6 源码得到）
+
+- Mali450 **只有在「非全屏 damage」时才生成 PP stream**：
+  `lima_update_pp_stream()` 里 `!lima_damage_fullscreen(job)` 才走
+  `lima_update_damage_pp_stream()`，否则 `ctx->pp_stream.map = NULL` 走 DLBU。
+  所以局部窗口/光标/文字走 PP stream，全屏渲染不走。
+- `LIMA_CTX_PLB_BLK_SIZE = 512` 字节/16×16 tile，`plb_max_blk = 4096`(Mali450)
+  → 每个 context 两张 2MB 的 PLB BO。
+- `LIMA_PLB_PP_STREAM_CACHE_SIZE` 默认 **0**，即 PP stream 的 BO 每次重建、不缓存。
+
 ## lima_pp.c 复盘 —— PP 出错时 dump 现场（**已被证伪**）
 
 > 这一节记录的是**已经被证伪**的一轮排查，留在这里是因为下面"运维经验"那几条

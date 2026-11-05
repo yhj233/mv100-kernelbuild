@@ -423,6 +423,17 @@ static void lima_hang_dump(struct lima_device *ldev,
 		pipe == &ldev->pipe[lima_pipe_gp] ? "gp" : "pp",
 		task, task->frame);
 
+	/*
+	 * A job completes only when atomic_dec_and_test(&pipe->task) hits zero.
+	 * So idle hardware + non-zero task_count == a completion IRQ was lost or
+	 * a decrement never happened.  That is the difference between "the GPU
+	 * hung" and "nobody told the scheduler the GPU finished".
+	 */
+	dev_err(ldev->dev,
+		"[hang] sched task_count=%d done=%08x num_processor=%d error=%d\n",
+		atomic_read(&pipe->task), pipe->done, pipe->num_processor,
+		pipe->error);
+
 	ip = ldev->ip + lima_ip_gp;
 	if (ip->present) {
 		m = ip->iomem;
@@ -442,20 +453,40 @@ static void lima_hang_dump(struct lima_device *ldev,
 			readl(m + LIMA_GP_PLBU_ALLOC_END_ADDR));
 	}
 
-	for (i = 0; i < ldev->num_pp; i++) {
+	for (i = 0; i < pipe->num_processor; i++) {
 		ip = ldev->ip + lima_ip_pp0 + i;
 		if (!ip->present)
 			continue;
 		m = ip->iomem;
+		/* intmask==0 means a previous error IRQ masked this PP and the
+		 * hard reset that would restore it never ran -- PP then cannot
+		 * report completion. */
 		dev_err(ldev->dev,
-			"[hang] pp%d status=%08x rawstat=%08x curlist=%08x frame=%08x stack=%08x stacksz=%08x ctrl=%08x\n",
+			"[hang] pp%d status=%08x rawstat=%08x intstat=%08x intmask=%08x curlist=%08x frame=%08x stack=%08x stacksz=%08x ctrl=%08x\n",
 			i, readl(m + LIMA_PP_STATUS),
 			readl(m + LIMA_PP_INT_RAWSTAT),
+			readl(m + LIMA_PP_INT_STATUS),
+			readl(m + LIMA_PP_INT_MASK),
 			readl(m + LIMA_PP_CURRENT_REND_LIST_ADDR),
 			readl(m + LIMA_PP_FRAME),
 			readl(m + LIMA_PP_STACK),
 			readl(m + LIMA_PP_STACK_SIZE),
 			readl(m + LIMA_PP_CTRL));
+	}
+
+	/* DLBU is what actually assigns tiles to the two PP cores on M450. */
+	ip = ldev->ip + lima_ip_dlbu;
+	if (ip->present) {
+		m = ip->iomem;
+		dev_err(ldev->dev,
+			"[hang] dlbu phys=%08x vaddr=%08x vbase=%08x fbdim=%08x conf=%08x tilepos=%08x enmask=%08x\n",
+			readl(m + LIMA_DLBU_MASTER_TLLIST_PHYS_ADDR),
+			readl(m + LIMA_DLBU_MASTER_TLLIST_VADDR),
+			readl(m + LIMA_DLBU_TLLIST_VBASEADDR),
+			readl(m + LIMA_DLBU_FB_DIM),
+			readl(m + LIMA_DLBU_TLLIST_CONF),
+			readl(m + LIMA_DLBU_START_TILE_POS),
+			readl(m + LIMA_DLBU_PP_ENABLE_MASK));
 	}
 
 	ip = ldev->ip + lima_ip_gpmmu;
@@ -470,7 +501,7 @@ static void lima_hang_dump(struct lima_device *ldev,
 	}
 	/* MMU page tables are described by the DTE; a non-zero rawstat here
 	 * means the stall is a translation fault and not a PP/GP problem. */
-	for (i = 0; i < ldev->num_pp; i++) {
+	for (i = 0; i < pipe->num_processor; i++) {
 		ip = ldev->ip + lima_ip_ppmmu0 + i;
 		if (!ip->present)
 			continue;
