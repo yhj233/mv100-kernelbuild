@@ -220,6 +220,24 @@ M450 上每个 PP 的完成中断会在同一次 IRQ 里被**两个 handler 各�
 另外给 bcast 的 `dec` 加了 `atomic_read(&pipe->task) > 0` 的护栏，
 防止迟到的完成中断把计数减成负数、从而让**下一个**任务被陈旧中断提前完成。
 
+### 验证结果（run #21）：计数修好了，plist 错误**没修好**
+
+刷 run #21 后同样的负载，超时 dump 从 `task_count=-3` 变成：
+
+```
+[hang] sched task_count=0 done=00000003 num_processor=2 error=1
+```
+
+计数完全对上了（2 个 PP，2 次 dec，落到 0）。**但第一个 PP 错误仍在 X 起来后
+约 0.7s 出现**，形态还是 `state=201 status=40`
+（`END_OF_FRAME | INVALID_PLIST_COMMAND`），124 次错误里 122 次都是它。
+
+所以"提前完成导致 plist 被回收"这个因果链**不成立**，`INVALID_PLIST_COMMAND`
+是独立的上游问题（看实测，是 Xorg glamor 的 2D 任务在报，而 glxgears 这种纯 3D
+客户端几乎不报，且在 lima 上能跑到 106 FPS）。
+
+这个补丁本身仍然是对上游的实质修复（重复递减/下溢是确凿的 bug），保留。
+
 ### 相关寄存器/结构事实
 
 - `LIMA_PP_IRQ_MASK_USED = END_OF_FRAME | MASK_ERROR`，**不含 `HANG`(bit2)**
