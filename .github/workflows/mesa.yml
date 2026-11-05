@@ -28,17 +28,21 @@ jobs:
       - name: Checkout (this repo)
         uses: actions/checkout@v4
 
-      - name: Enable arm32 emulation
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm
-
-      - name: Show qemu / docker
+      - name: Install qemu-user-static (bwrap-free)
         run: |
-          docker version --format '{{.Server.Version}}'
-          ls /proc/sys/fs/binfmt_misc/ | head -20
+          set -x
+          # The ubuntu-24.04 runner has qemu-user-static preinstalled via
+          # docker.io, but docker/setup-qemu-action (used before) pulled a
+          # separate qemu binary and hung the whole job at "Set up job".
+          # Instead, rely on the distro package and make sure binfmt_misc
+          # is registered for arm before docker tries --platform arm/v7.
+          docker run --rm --platform linux/arm/v7 alpine:3.19 true \
+            && echo "arm emulation OK" \
+            || sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user-static
+          ls -l /proc/sys/fs/binfmt_misc/ | head -20 || true
 
       - name: Build inside ubuntu:20.04 armhf
+        timeout-minutes: 240
         run: |
           set -x
           rm -rf out && mkdir -p out
