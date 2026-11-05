@@ -208,18 +208,35 @@ do_config() {
 	"${cfg[@]}" -e CGROUP_PIDS
 	"${cfg[@]}" -e FANOTIFY
 
-	# timers: this board's only clocksource is the SP804 (rating 200), and
-	# high resolution timers come out *disabled* even though
-	# multi_v7_defconfig asks for them (no hrtimer_switch_to_hres in
-	# /proc/kallsyms, and /proc/timer_list reports a 10 ms hrtimer base).
-	# With hres off and HZ=100 every nanosleep() is rounded up to a 10 ms
-	# tick, so userspace polling loops that sleep 20 us run 500x slow:
-	# Mesa's kmsro render-node discovery loops 3000 times and creating a GBM
-	# device takes 30 s instead of 60 ms.  HZ=1000 is the fallback floor if
-	# hres still refuses to arm on the SP804.
+	# timers.
+	#
+	# The board has no arm,armv7-timer node, so the only clock source is the
+	# SP804 (24 MHz, 41 ns) and the SP804 clock event ends up as the
+	# *broadcast* device -- /sys/devices/system/clockevents/clockevent*/ says
+	# current_device=dummy_timer for every CPU.  That makes high resolution
+	# timers impossible, and the kernel says so out loud at boot:
+	#
+	#   Clockevents: could not switch to one-shot mode:
+	#    dummy_timer is not functional.
+	#
+	# ("not functional" == CLOCK_EVT_FEAT_DUMMY, which tick_switch_to_oneshot()
+	# rejects outright.)  HIGH_RES_TIMERS is still kept =y so the day someone
+	# adds an arm,armv7-timer node it just starts working, but do not expect
+	# it to arm today.
+	#
+	# So the tick interval IS the sleep granularity.  HZ=100 rounded every
+	# nanosleep() up to 10 ms, which turned libdrm's "retry a missing render
+	# node 3000 times with usleep(20)" loop into a 30 second stall in
+	# gbm_create_device().  HZ=1000 cuts that to 1 ms.  Cost measured on the
+	# box: glxgears 124.6 -> 124.0 fps, ~1000 extra IRQs/s -- noise.
 	"${cfg[@]}" -e HIGH_RES_TIMERS
 	"${cfg[@]}" -d HZ_100
 	"${cfg[@]}" -e HZ_1000
+
+	# let us read the running kernel's config (/proc/config.gz) instead of
+	# guessing which options actually survived olddefconfig.
+	"${cfg[@]}" -e IKCONFIG
+	"${cfg[@]}" -e IKCONFIG_PROC
 
 	# boot-critical plumbing.
 	# CMDLINE_PARTITION is what parses the vendor's blkdevparts= argument
@@ -245,7 +262,7 @@ do_config() {
 	make -C "$SRC" ARCH=arm CROSS_COMPILE="$CROSS" O="$OUT" olddefconfig
 
 	step "resulting mv100 options"
-	grep -E "HISTB|HI3798MV100|HISI_FESTA|FEMAC|LIMA|APPENDED_DTB|^CONFIG_CMDLINE|^CONFIG_SOUND|^CONFIG_SND|^CONFIG_CGROUP|^CONFIG_FANOTIFY|^CONFIG_MMC_BLOCK|^CONFIG_EXT4_FS|^CONFIG_SERIAL_AMBA|^CONFIG_HZ|HIGH_RES_TIMERS|^CONFIG_NO_HZ" \
+	grep -E "HISTB|HI3798MV100|HISI_FESTA|FEMAC|LIMA|APPENDED_DTB|^CONFIG_CMDLINE|^CONFIG_SOUND|^CONFIG_SND|^CONFIG_CGROUP|^CONFIG_FANOTIFY|^CONFIG_MMC_BLOCK|^CONFIG_EXT4_FS|^CONFIG_SERIAL_AMBA|^CONFIG_HZ|HIGH_RES_TIMERS|^CONFIG_NO_HZ|^CONFIG_IKCONFIG|TICK_ONESHOT|GETTIMEOFFSET|ARM_ARCH_TIMER" \
 		"$OUT/.config" || true
 
 	step "verifying every required option is built in"

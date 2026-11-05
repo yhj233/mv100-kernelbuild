@@ -53,37 +53,100 @@ drm_crtc_vblank_off(crtc);
   从 `histb-vdp2` 改成 kmsro 认识的名字（`sun4i-drm`），Mesa 才会用 lima 渲染、
   经 DMA-BUF 交给 vdp2 扫描输出。只有 vblank 修好之后这条路才跑得动。
 
-## lima_pp.c —— PP 出错时 dump 现场（**临时诊断补丁**）
+## lima_pp.c —— PP 出错时 dump 现场（**临时诊断补丁，结论已被推翻**）
 
-**症状**：X/glamor 走 lima(kmsro) 时，一启动就刷
+> 这一节记录的是**已经被证伪**的一轮排查，留在这里是因为下面"运维经验"那几条
+> 踩坑成本很高。**不要再按这里的思路继续挖 PP**。当前有效结论见本节末尾。
+
+**当初的症状**：X/glamor 走 lima(kmsro) 时一启动就刷
 
 ```
 pp0/pp1 error irq state=201 status=40
 pp0/pp1 task error int_state=0 status=0
-pp0/pp1 bus stop timeout     -> GPU 卡在 RENDERING_ACTIVE，此后再也复位不了
+pp0/pp1 job timeout
+pp0/pp1 bus stop timeout
 ```
 
-`state=0x201` = `END_OF_FRAME | INVALID_PLIST_COMMAND`；
-`status=0x40` = `BUS_ERROR`（与 GP_STATUS 的 bit6 定义一致）。两者同时出现
-说明 PP 去读了不该读的地址。**注意 MMU 一条 fault 都没有**，所以不是页表缺失，
-而是 PP 拿到的地址/配置本身不对。
+**曾经的错误推断**：`state=0x201` 被拆成 `END_OF_FRAME | INVALID_PLIST_COMMAND`、
+`status=0x40` 被当成 `BUS_ERROR`，于是推论"PP 读了不该读的地址"，进而怀疑
+26x32 的小 pixmap 是 X 光标、怀疑 `fragment_stack_address=0` 是根因。
+（顺带确认了 `struct lima_pp_frame_reg` 的字段顺序：
+`[10]=width [11]=height [12]=fragment_stack_address [13]=fragment_stack_size
+[17]=supersampled_height`；以及 `lima_job.c:971` 只在 `pp_max_stack_size` 非 0 时
+才建 stack BO，否则这两个字段就是 0——`lima_job.c:874` 写的是
+`size << 16 | size`。）
 
-**已知线索**（第 2 版 dump 得到）：
-- 出错任务是个 26x32 的小 pixmap（`frame[10]=25, frame[11]=31`,
-  `frame[17]=supersampled_height=63`）——量级上正是 X **光标**的尺寸，
-  与「X 一启动就崩」吻合。
-- `frame[12]=fragment_stack_address=0`、`frame[13]=fragment_stack_size=0`。
-  内核 `lima_pp_task_run()` 会无条件把它们写进 `PP_STACK` / `PP_STACK_SIZE`。
-  但纯 clear 的 GBM 测试（lima_bench，369fps）同样 stack=0 却不报错，
-  所以 stack=0 本身未必致命，需要实测寄存器确认。
+**推翻它的证据**：把 dmesg 拉成时间线数了一遍——
 
-**这一版加了什么**：
-1. `lima_pp_dump_hw()`：在 **中断上下文、hard reset 之前** 读 PP 硬件寄存器
-   （FRAME/RSW/STACK/STACKSZ/STATUS/CUR_REND_LIST/BUS_ERR/ORIGIN_X/INT_RAW）。
-   上一版是在复位之后 dump，寄存器已被清零，拿到的值没有意义。
-2. `lima_pp_dump_task()`：work 上下文 dump task 描述符、23 个 frame 寄存器、
-   `plbu_array_address` / `fragment_stack_address`。
-3. `lima_pp_dump_va()`：把 VA 反查回所属 BO 并 dump 内容；
-   BO 未被 CPU 映射时用 `drm_gem_shmem_vmap_locked()` 临时映射。
+```
+job timeout            1 次
+pp error irq state=201 36 次     ← 全部落在 lima_pp_hard_reset() 之后 ~1.4ms
+```
 
-**注意**：诊断用，定位完应删除（从 `patches/` 删掉，build.sh 就不再覆盖）。
+首个 error IRQ 在 timeout **之后** 1.4ms 才出现，且 `lima_pp_task_error()` 里读到的
+`int_state=0 status=0`（寄存器已被复位清空）。**36 次全是 FORCE_RESET 复位动作
+自身的副产物，不是故障现场。** 真正的事件只有那 1 次 `job timeout`：PP 卡在
+`RENDERING_ACTIVE` 不再前进，之后 driver 反复 reset，每次 reset 都刷一条
+`state=201`。
+
+**现在的结论**：
+
+1. **lima 的 3D/视频通路本身是好的**。用真实素材验证过：
+
+   ```
+   mpv --vo=gpu --gpu-context=drm --ao=null --drm-atomic=no /home/ubuntu/t720.mp4
+   GL_VENDOR=lima  GL_RENDERER=Mali450
+   frame-drop-count = 0        （30 秒 720p30 H.264 + AAC，pos 3.2 → 33.2 线性推进）
+   pp error irq     = 0 次
+   ```
+
+   所以"lima 在这颗 SoC 上不能用"是错的，PP 超时是**特定场景**才触发。
+
+2. **PP 超时只在 X/glamor 场景出现**。桌面（llvmpipe）正常，DRM 直出（lima）正常，
+   唯独 Xorg 挂上 glamor 后走 kmsro 就卡死。第一因还没定位，但排查面已经从
+   "lima 驱动整体" 收窄到 "glamor + kmsro 的提交序列"。
+
+3. **这个补丁到此为止**。它 dump 的东西（PP 硬件寄存器、task 描述符、VA 反查）
+   在"复位后噪声"这个前提下没有信息量。定位完成后应从 `patches/` 删掉，
+   build.sh 不再覆盖即可恢复原版。
+
+**这一版（v5）改了什么**：只修了输出格式。v3/v4 用 `dev_err()` 打半行 + `pr_cont()`
+续行，实测在 printk 的 `KERN_CONT` 合并路径上被其它输出打断，dump 出来只有
+`reg[00]:` 后面没有数值。改成 `snprintf` 拼整行再 `dev_err("%s\n", line)`。
+
+**运维经验（这轮最值钱的部分）**：
+
+- **`--vo=drm` 不走 GPU**。mpv 0.32 的 `vo=drm` 是老式 legacy modesetting +
+  CPU swscale 直写 framebuffer，日志里是 `Using Legacy Modesetting` 和
+  `swscaler ... using C`。要走 Mali 必须 `--vo=gpu --gpu-context=drm`。
+  `bili --drm` 之所以流畅，是因为它**完全绕开了渲染**，不是因为 GPU 好用。
+- **`--drm-atomic=no`** 可绕过 `Failed to commit atomic request (-22)`
+  （vdp2 的 atomic commit 返回 EINVAL，非致命，drm.debug 里看不到拒绝点）。
+- **测 fps 必须带音轨**。lavfi 的 `testsrc` 没音频，mpv 靠音频时钟同步，
+  会报 11% 的假丢帧。用 ffmpeg 生成带 AAC 的 mp4 + `--ao=null` 才能拿到 drop=0。
+- **`MESA_LOADER_DRIVER_OVERRIDE=sun4i-drm` 完全替代了 `libfake_drm_name.so`**。
+  后者是 LD_PRELOAD 改 `drmGetVersion` 的返回值，前者是 Mesa 自带的加载器覆盖，
+  更干净，也不影响其它进程。
+
+## histb-vdp2.c 还剩一个 bug —— flush 阶段就发 vblank 事件
+
+`histb_vdp2_crtc_atomic_flush()` 第 1450 行附近：
+
+```c
+if (new_state->event) {
+    spin_lock_irq(&crtc->dev->event_lock);
+    drm_crtc_send_vblank_event(crtc, new_state->event);   /* ← 问题在这 */
+    new_state->event = NULL;
+    spin_unlock_irq(&crtc->dev->event_lock);
+}
+```
+
+`send_vblank_event()` 是**立即**把事件发出去，而此刻帧还没扫描出去。客户端（mpv）
+拿到的事件时间戳/MSC 与真实 vblank 对不上，日志里就是：
+
+```
+Got the same msc value twice ... Possibly broken driver/interlaced mode?
+```
+
+应该改成 `drm_crtc_arm_vblank_event(crtc, new_state->event)`——排队到下一个
+vblank 再发，这也是 atomic 驱动的标准写法。**尚未修改**，等 PP 那条线定了再一起动。
