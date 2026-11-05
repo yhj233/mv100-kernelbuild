@@ -149,9 +149,13 @@ grep -E "Gallium drivers|GLX|shared-glapi|Platforms|LLVM" build/meson-logs/meson
 
 echo
 echo "=============================================================="
-echo " 7. ninja (lima_dri.so only)"
+echo " 7. ninja (lima_dri.so = the megadriver libgallium_dri.so)"
 echo "=============================================================="
-if ! ninja -C build -j"$JOBS" src/gallium/targets/dri/lima_dri.so; then
+# Mesa 21.2 builds lima as part of the "megadriver": every DRI driver is
+# compiled into one libgallium_dri.so, and `install_megadrivers.py` turns it
+# into per-driver .so files (lima_dri.so, etc.) at install time.  There is no
+# standalone lima_dri.so ninja target, so build the megadriver target.
+if ! ninja -C build -j"$JOBS" src/gallium/targets/dri/libgallium_dri.so; then
   echo "!! targeted build failed, falling back to a full build"
   ninja -C build -j"$JOBS"
 fi
@@ -160,8 +164,8 @@ echo
 echo "=============================================================="
 echo " 8. result"
 echo "=============================================================="
-SO=$(find build -name 'lima_dri.so' -type f | head -1)
-[ -n "$SO" ] || { echo "!! lima_dri.so not found"; find build -name '*.so' | head -20; exit 1; }
+SO=$(find build -name 'libgallium_dri.so' -type f | head -1)
+[ -n "$SO" ] || { echo "!! libgallium_dri.so not found"; find build -name '*.so' | head -20; exit 1; }
 echo "built: $SO"
 ls -l "$SO"
 file "$SO"
@@ -171,12 +175,14 @@ echo "--- max GLIBC symbol version (must be <= 2.31) ---"
 readelf --version-info "$SO" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu | tail -3
 echo "--- max GLIBCXX symbol version (must be <= 3.4.28) ---"
 readelf --version-info "$SO" | grep -oE 'GLIBCXX_[0-9.]+' | sort -Vu | tail -3 || true
+echo "--- lima driver symbol present (megadriver marker) ---"
+nm -D "$SO" | grep -c '__driDriverGetExtensions_lima' || true
 echo "--- exported symbols ---"
 nm -D --defined-only "$SO" | wc -l
 
 mkdir -p $OUT
-cp "$SO" $OUT/lima_dri.so
-sha256sum $OUT/lima_dri.so | tee $OUT/sha256.txt
+cp "$SO" $OUT/libgallium_dri.so
+sha256sum $OUT/libgallium_dri.so | tee $OUT/sha256.txt
 echo "GLIBC max: $(readelf --version-info "$SO" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu | tail -1)" > $OUT/info.txt
 echo "mesa: $MESA_VER" >> $OUT/info.txt
 chmod -R a+rX $OUT
