@@ -13,6 +13,7 @@
 #include "lima_dlbu.h"
 #include "lima_bcast.h"
 #include "lima_vm.h"
+#include "lima_gem.h"
 #include "lima_regs.h"
 
 #define pp_write(reg, data) writel(data, ip->iomem + reg)
@@ -421,45 +422,109 @@ static void lima_pp_task_fini(struct lima_sched_pipe *pipe)
 }
 
 
-/* ---- mv100 debug: dump task descriptor and VM mapping on PP error ---- */
+/* ---- mv100 debug: dump task descriptor + GPU command stream on PP error ---- */
+static int mv100_pp_dumps;
+
+static void lima_pp_dump_u32(struct lima_device *dev, const char *tag,
+			     const u32 *p, int n)
+{
+	int i, j;
+
+	for (i = 0; i < n; i += 8) {
+		int m = (n - i) < 8 ? (n - i) : 8;
+
+		dev_err(dev->dev, "  %s[%02d]:", tag, i);
+		for (j = 0; j < m; j++)
+			pr_cont(" %08x", p[i + j]);
+		pr_cont("\n");
+	}
+}
+
+/* 把 GPU 侧的 VA 翻译回它所属的 BO，并 dump 那段内容 */
+static void lima_pp_dump_va(struct lima_device *dev, struct lima_sched_task *task,
+			    u32 va, const char *tag)
+{
+	struct lima_vm *vm = task->vm;
+	int i;
+
+	if (!vm)
+		return;
+
+	for (i = 0; i < task->num_bos; i++) {
+		struct lima_bo *bo = task->bos[i];
+		size_t size = lima_bo_size(bo);
+		u32 bo_va = lima_vm_get_va(vm, bo);
+		char *base;
+		size_t off;
+
+		if (!bo_va || va < bo_va || va >= bo_va + size)
+			continue;
+
+		off = (size_t)(va - bo_va) & ~3UL;
+		base = bo->base.vaddr;
+		dev_err(dev->dev,
+			"  %s va=%08x -> bo[%d] va=%08x size=%zu off=%zu kva=%px\n",
+			tag, va, i, bo_va, size, off, base);
+		if (!base || off + 4 * 16 > size)
+			return;
+		lima_pp_dump_u32(dev, tag, (const u32 *)(base + off), 16);
+		return;
+	}
+
+	dev_err(dev->dev, "  %s va=%08x NOT FOUND in %d bos\n",
+		tag, va, task->num_bos);
+}
+
 static void lima_pp_dump_task(struct lima_device *dev, struct lima_sched_pipe *pipe,
 			      struct lima_ip *ip)
 {
 	struct lima_sched_task *task = pipe->current_task;
-	struct lima_vm *vm;
-	u32 *f;
 	int i;
 
-	if (!task)
+	if (!task) {
+		dev_err(dev->dev, "%s no current task to dump\n", lima_ip_name(ip));
 		return;
-
-	dev_err(dev->dev, "%s current task seqno=%u frame=%px heap=%px\n",
-		lima_ip_name(ip), task->base.s_fence->finished.seqno,
-		task->frame, task->heap);
-
-	f = task->frame;
-	if (f) {
-		for (i = 0; i < 32; i += 8)
-			dev_err(dev->dev,
-				"  frame[%02d]=%08x %08x %08x %08x %08x %08x %08x %08x\n",
-				i, f[i], f[i+1], f[i+2], f[i+3],
-				f[i+4], f[i+5], f[i+6], f[i+7]);
 	}
 
-	vm = task->vm ? task->vm : pipe->current_vm;
-	if (!vm || !vm->pd.cpu)
-		return;
+	dev_err(dev->dev,
+		"%s task seqno=%llu frame=%px heap=%px num_bos=%d vm=%px\n",
+		lima_ip_name(ip),
+		(unsigned long long)task->base.s_fence->finished.seqno,
+		task->frame, task->heap, task->num_bos, task->vm);
 
-	dev_err(dev->dev, "  vm pd.dma=%pad\n", &vm->pd.dma);
-	for (i = 0; i < 2; i++) {
-		u32 *pt = vm->bts[i].cpu;
-		int k;
+	if (pipe->bcast_processor) {
+		struct drm_lima_m450_pp_frame *f = task->frame;
 
-		if (!pt)
-			continue;
-		dev_err(dev->dev, "  bt%d dma=%pad\n", i, &vm->bts[i].dma);
-		for (k = 0; k < 16; k++)
-			dev_err(dev->dev, "    pt%03x=%08x\n", k, pt[k]);
+		dev_err(dev->dev, "  m450 num_pp=%u use_dlbu=%u\n",
+			f->num_pp, f->use_dlbu);
+		lima_pp_dump_u32(dev, "reg", f->frame, LIMA_PP_FRAME_REG_NUM);
+		for (i = 0; i < 8; i++)
+			dev_err(dev->dev, "  pp%d plbu_va=%08x stack_va=%08x\n", i,
+				f->plbu_array_address[i], f->fragment_stack_address[i]);
+		lima_pp_dump_va(dev, task, f->plbu_array_address[0], "plbu");
+		lima_pp_dump_va(dev, task, f->fragment_stack_address[0], "stack");
+	} else {
+		struct drm_lima_m400_pp_frame *f = task->frame;
+
+		dev_err(dev->dev, "  m400 num_pp=%u\n", f->num_pp);
+		lima_pp_dump_u32(dev, "reg", f->frame, LIMA_PP_FRAME_REG_NUM);
+		for (i = 0; i < 4; i++)
+			dev_err(dev->dev, "  pp%d plbu_va=%08x stack_va=%08x\n", i,
+				f->plbu_array_address[i], f->fragment_stack_address[i]);
+		lima_pp_dump_va(dev, task, f->plbu_array_address[0], "plbu");
+		lima_pp_dump_va(dev, task, f->fragment_stack_address[0], "stack");
+	}
+
+	if (task->vm)
+		dev_err(dev->dev, "  vm pd.dma=%pad\n", &task->vm->pd.dma);
+	for (i = 0; i < task->num_bos; i++) {
+		if (task->vm)
+			dev_err(dev->dev, "  bo[%d] va=%08x size=%zu\n", i,
+				lima_vm_get_va(task->vm, task->bos[i]),
+				lima_bo_size(task->bos[i]));
+		else
+			dev_err(dev->dev, "  bo[%d] size=%zu\n", i,
+				lima_bo_size(task->bos[i]));
 	}
 }
 
@@ -495,7 +560,10 @@ static void lima_pp_task_error(struct lima_sched_pipe *pipe)
 	if (pipe->bcast_processor)
 		lima_bcast_reset(pipe->bcast_processor);
 
-	lima_pp_dump_task(pipe->ldev, pipe, pipe->processor[0]);
+	if (mv100_pp_dumps < 3) {
+		mv100_pp_dumps++;
+		lima_pp_dump_task(pipe->ldev, pipe, pipe->processor[0]);
+	}
 }
 
 static void lima_pp_task_mmu_error(struct lima_sched_pipe *pipe)

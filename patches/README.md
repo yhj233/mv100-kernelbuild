@@ -53,26 +53,27 @@ drm_crtc_vblank_off(crtc);
   从 `histb-vdp2` 改成 kmsro 认识的名字（`sun4i-drm`），Mesa 才会用 lima 渲染、
   经 DMA-BUF 交给 vdp2 扫描输出。只有 vblank 修好之后这条路才跑得动。
 
-## lima_pp.c —— PP 出错时 dump task 描述符与 VM 页表（**临时诊断补丁**）
+## lima_pp.c —— PP 出错时 dump task 描述符与 GPU 命令流（**临时诊断补丁**）
 
 **目的**：lima 在 X/kmsro 负载下持续报
 
 ```
-lima f9200000.gpu: pp0 error irq state=201 status=40
-lima f9200000.gpu: pp0 task error 0 / pp1 task error 1 int_state=0 status=0
+lima f9200000.gpu: pp0/pp1 error irq state=201 status=40
+lima f9200000.gpu: pp0/pp1 task error 0/1 int_state=0 status=0
 lima f9200000.gpu: pp0/pp1 reset time out
 ```
 
 `state=0x201` 拆开是 `BIT(0) END_OF_FRAME | BIT(9) INVALID_PLIST_COMMAND`
-（`lima_regs.h: LIMA_PP_IRQ_INVALID_PLIST_COMMAND`），即 GPU 读到的图元命令流非法，
-不是直觉上的"总线错误"。要确定是「PLIST 地址指向错地方」还是「命令本身不合法」，
-需要看出错那一刻的：
+（`lima_regs.h: LIMA_PP_IRQ_INVALID_PLIST_COMMAND`）：GPU 读到的图元命令流非法。
+MMU 一条 fault 都没有，说明地址转换是通的，问题在命令流内容本身。
 
-- `task->frame` 的原始内容（GPU 实际执行的描述符）
-- 该 task 的 VM 页表（VA → 物理地址映射）
-- `int_state` 的位含义（避免再靠猜）
+**改动**（只加打印，不动逻辑，最多打印 3 次避免刷屏）：
 
-**改动**（只加打印，不动逻辑）：在 `lima_pp_task_error()` 里对 `pipe->current_task`
-dump 前 32 个 u32 描述符、`vm->pd.dma`、前两个 `bts[]` 的物理页和一个页表窗口。
+1. `int_state` 逐位翻译成名字（不再靠十六进制猜）
+2. `task->frame` 的 23 个 PP 寄存器原值
+3. 每个 PP 的 `plbu_array_address` / `fragment_stack_address`（GPU 真正去读的 GPU VA）
+4. 拿这两个 VA 反查所属 BO（`lima_vm_get_va`），dump 那段 16 个 u32 —— 也就是
+   GPU 眼里「非法命令流」的实际内容
+5. `vm->pd.dma`、全部 BO 的 `va`/`size` 清单
 
-**注意**：这是诊断用的，定位完应当删除（`patches/` 里删掉即可，build.sh 就不覆盖了）。
+**注意**：诊断用，定位完应删除（从 `patches/` 删掉，build.sh 就不再覆盖）。
