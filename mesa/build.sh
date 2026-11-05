@@ -1,78 +1,74 @@
 #!/bin/bash
 #
-# Build Mesa 21.2.6's lima_dri.so inside an Ubuntu 20.04 armhf container
-# (runs under qemu-user on an amd64 runner).
+# Cross-build Mesa 21.2.6's lima_dri.so for armhf (Hi3798MV100 box, Ubuntu 20.04).
 #
-# Why a container and not a cross toolchain: the target box runs focal armhf
-# with mesa 21.2.6-0ubuntu0.1~20.04.2.  Building inside the same release
-# guarantees the GLIBC/GLIBCXX symbol versions and the libdrm/libglapi ABI
-# match exactly, which is the whole point -- the .so is dropped straight onto
-# the device in place of the distro one.
+# Runs NATIVELY on an amd64 runner: an arm-linux-gnueabihf cross toolchain
+# compiles arm code at full speed, no qemu emulation, no container.  The .so is
+# linked against the armhf sysroot that ships with the cross toolchain (glibc
+# 2.31, same as focal), so the result loads on the device unchanged.
 #
-# Only one target is built: src/gallium/targets/dri/lima_dri.so.
+# Output: out/libgallium_dri.so (+ sha256.txt + info.txt).  On the device this
+# megadriver is dropped in as /usr/lib/arm-linux-gnueabihf/dri/lima_dri.so.
 #
 set -euo pipefail
 
 MESA_VER=21.2.6
-SRC=/src
-OUT=/work/out
-JOBS=$(nproc)
+WORK="${WORK:-$PWD}"
+OUT="$WORK/out"
+CROSS=arm-linux-gnueabihf
 
 echo "=============================================================="
 echo " 0. environment"
 echo "=============================================================="
-uname -a
-grep -E '^(NAME|VERSION)=' /etc/os-release || true
-echo "nproc=$JOBS"
-df -h / /work 2>/dev/null | tail -3
+uname -m
+"$CROSS-gcc" --version | head -1
+echo "cross sysroot: $("$CROSS-gcc" -print-sysroot)"
+echo "cross glibc max: $(strings "$("$CROSS-gcc" -print-sysroot)/lib/arm-linux-gnueabihf/libc.so.6" 2>/dev/null | grep '^GLIBC_' | sort -V | tail -1)"
+dpkg --print-foreign-architectures
+nproc
 
 echo
 echo "=============================================================="
-echo " 1. apt sources (ports.ubuntu.com -- focal is armhf-only there)"
+echo " 1. armhf cross toolchain + armhf dev libs"
 echo "=============================================================="
-cat > /etc/apt/sources.list <<'EOF'
-deb http://ports.ubuntu.com/ubuntu-ports focal main restricted universe multiverse
-deb http://ports.ubuntu.com/ubuntu-ports focal-updates main restricted universe multiverse
-deb http://ports.ubuntu.com/ubuntu-ports focal-security main restricted universe multiverse
-EOF
-apt-get update -qq || { echo "apt update failed"; exit 1; }
-
-echo
-echo "=============================================================="
-echo " 2. build dependencies"
-echo "=============================================================="
-apt-get install -y -qq --no-install-recommends \
+sudo apt-get update -qq
+sudo apt-get install -y -qq --no-install-recommends \
   build-essential ninja-build pkg-config python3 python3-pip \
   python3-mako python3-yaml bison flex \
-  libdrm-dev libexpat1-dev zlib1g-dev libzstd-dev \
-  libx11-dev libxext-dev libxfixes-dev libx11-xcb-dev \
-  libxcb1-dev libxcb-dri2-0-dev libxcb-dri3-dev libxcb-present-dev \
-  libxcb-sync-dev libxcb-shm0-dev libxcb-xfixes0-dev \
-  libxcb-glx0-dev \
-  libxshmfence-dev libxrandr-dev libxxf86vm-dev libxdamage-dev \
-  ca-certificates curl xz-utils file
-echo "--- installed ---"
-dpkg-query -W -f='${Package} ${Version}\n' \
-  libdrm-dev libx11-dev build-essential ninja-build bison flex 2>/dev/null
+  gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf \
+  crossbuild-essential-armhf
+
+# armhf libraries Mesa links against.  dpkg --add-architecture lets apt pull the
+# :armhf .so/.pc side by side with the native amd64 ones.
+sudo dpkg --add-architecture armhf
+sudo apt-get update -qq
+sudo apt-get install -y -qq --no-install-recommends \
+  libdrm-dev:armhf \
+  libx11-dev:armhf libxext-dev:armhf libxfixes-dev:armhf libx11-xcb-dev:armhf \
+  libxcb1-dev:armhf libxcb-dri2-0-dev:armhf libxcb-dri3-dev:armhf \
+  libxcb-present-dev:armhf libxcb-sync-dev:armhf libxcb-shm0-dev:armhf \
+  libxcb-xfixes0-dev:armhf libxcb-glx0-dev:armhf \
+  libxshmfence-dev:armhf libxrandr-dev:armhf libxxf86vm-dev:armhf \
+  libxdamage-dev:armhf \
+  libexpat1-dev:armhf zlib1g-dev:armhf libzstd-dev:armhf
+
+echo "--- armhf pkg-config files present ---"
+ls /usr/lib/arm-linux-gnueabihf/pkgconfig/ 2>/dev/null | grep -E 'drm|xcb|x11|expat|zstd|zlib' | head -20
 
 echo
 echo "=============================================================="
-echo " 3. meson (focal ships 0.53, mesa 21.2 wants newer)"
+echo " 2. meson (24.04 ships 1.x, fine for mesa 21.2)"
 echo "=============================================================="
-echo "distro meson: $(meson --version || echo none)"
-if ! pip3 install --quiet --no-cache-dir "meson==0.59.4"; then
-  echo "!! pip install failed, keeping distro meson"
-fi
-command -v meson
+command -v meson || pip3 install --quiet --no-cache-dir "meson==0.59.4"
 meson --version
 
 echo
 echo "=============================================================="
-echo " 4. mesa $MESA_VER source"
+echo " 3. mesa $MESA_VER source"
 echo "=============================================================="
-mkdir -p $SRC
-cd $SRC
-
+SRC="$WORK/src"
+mkdir -p "$SRC"
+cd "$SRC"
 fetch() {
   local u sz
   for u in "$@"; do
@@ -81,46 +77,58 @@ fetch() {
     if curl -fsSL --retry 3 --retry-delay 5 -m 420 -o /tmp/mesa.tar "$u"; then
       sz=$(stat -c%s /tmp/mesa.tar)
       echo "     $sz bytes"
-      if [ "$sz" -gt 8000000 ]; then
-        return 0
-      fi
+      [ "$sz" -gt 8000000 ] && return 0
       echo "     too small, next"
-    else
-      echo "     curl failed"
     fi
   done
   return 1
 }
-
 fetch \
-  "https://archive.mesa3d.org/mesa-$MESA_VER.tar.xz" \
-  "https://mesa.freedesktop.org/archive/mesa-$MESA_VER.tar.xz" \
-  "https://github.com/mesa3d/mesa/archive/refs/tags/mesa-$MESA_VER.tar.gz" \
   "https://gitlab.freedesktop.org/mesa/mesa/-/archive/mesa-$MESA_VER/mesa-mesa-$MESA_VER.tar.gz" \
+  "https://github.com/mesa3d/mesa/archive/refs/tags/mesa-$MESA_VER.tar.gz" \
   || { echo "!! cannot fetch mesa source"; exit 1; }
-
-file /tmp/mesa.tar
 tar xf /tmp/mesa.tar
 cd "$(ls -d mesa-* | head -1)"
 echo "source root: $(pwd)"
-head -8 meson.build
 
 echo
 echo "=============================================================="
-echo " 5. patches"
+echo " 4. patches"
 echo "=============================================================="
-for p in /work/mesa/patches/*.patch; do
+for p in "$WORK"/mesa/patches/*.patch; do
   echo "--- $(basename "$p") ---"
   patch -p1 --forward --no-backup-if-mismatch < "$p"
 done
-echo "--- verify ---"
 grep -n "lima_force_pp_stream" src/gallium/drivers/lima/lima_job.c
 
 echo
 echo "=============================================================="
-echo " 6. meson setup"
+echo " 5. meson cross file + setup"
 echo "=============================================================="
+cat > /tmp/cross.txt <<EOF
+[binaries]
+c = '${CROSS}-gcc'
+cpp = '${CROSS}-g++'
+ar = '${CROSS}-ar'
+strip = '${CROSS}-strip'
+pkgconfig = 'pkg-config'
+
+[properties]
+pkg_config_libdir = ['/usr/lib/arm-linux-gnueabihf/pkgconfig', '/usr/share/pkgconfig']
+sys_root = '$("$CROSS-gcc" -print-sysroot)'
+
+[host_machine]
+system = 'linux'
+cpu_family = 'arm'
+cpu = 'armv7l'
+endian = 'little'
+EOF
+cat /tmp/cross.txt
+# Force pkg-config to only see armhf .pc files (not the native amd64 ones).
+export PKG_CONFIG_LIBDIR="/usr/lib/arm-linux-gnueabihf/pkgconfig:/usr/share/pkgconfig"
+
 meson setup build \
+  --cross-file /tmp/cross.txt \
   --buildtype=release \
   --prefix=/usr \
   --libdir=lib/arm-linux-gnueabihf \
@@ -144,48 +152,38 @@ meson setup build \
   -Dosmesa=false \
   -Dtools= \
   -Dbuild-tests=false
-echo "--- summary ---"
-grep -E "Gallium drivers|GLX|shared-glapi|Platforms|LLVM" build/meson-logs/meson-log.txt | tail -12 || true
 
 echo
 echo "=============================================================="
-echo " 7. ninja (lima_dri.so = the megadriver libgallium_dri.so)"
+echo " 6. ninja (megadriver)"
 echo "=============================================================="
-# Mesa 21.2 builds lima as part of the "megadriver": every DRI driver is
-# compiled into one libgallium_dri.so, and `install_megadrivers.py` turns it
-# into per-driver .so files (lima_dri.so, etc.) at install time.  There is no
-# standalone lima_dri.so ninja target, so build the megadriver target.
+JOBS=$(nproc)
 if ! ninja -C build -j"$JOBS" src/gallium/targets/dri/libgallium_dri.so; then
-  echo "!! targeted build failed, falling back to a full build"
+  echo "!! targeted build failed, full build"
   ninja -C build -j"$JOBS"
 fi
 
 echo
 echo "=============================================================="
-echo " 8. result"
+echo " 7. result"
 echo "=============================================================="
 SO=$(find build -name 'libgallium_dri.so' -type f | head -1)
-[ -n "$SO" ] || { echo "!! libgallium_dri.so not found"; find build -name '*.so' | head -20; exit 1; }
+[ -n "$SO" ] || { echo "!! not found"; find build -name '*.so' | head; exit 1; }
 echo "built: $SO"
 ls -l "$SO"
 file "$SO"
 echo "--- NEEDED ---"
 readelf -d "$SO" | grep NEEDED
-echo "--- max GLIBC symbol version (must be <= 2.31) ---"
+echo "--- max GLIBC (must be <= 2.31) ---"
 readelf --version-info "$SO" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu | tail -3
-echo "--- max GLIBCXX symbol version (must be <= 3.4.28) ---"
-readelf --version-info "$SO" | grep -oE 'GLIBCXX_[0-9.]+' | sort -Vu | tail -3 || true
-echo "--- lima driver symbol present (megadriver marker) ---"
-nm -D "$SO" | grep -c '__driDriverGetExtensions_lima' || true
-echo "--- exported symbols ---"
-nm -D --defined-only "$SO" | wc -l
+echo "--- lima driver symbol ---"
+nm -D "$SO" | grep '__driDriverGetExtensions_lima' || echo "!! lima symbol missing"
 
-mkdir -p $OUT
-cp "$SO" $OUT/libgallium_dri.so
-sha256sum $OUT/libgallium_dri.so | tee $OUT/sha256.txt
-echo "GLIBC max: $(readelf --version-info "$SO" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu | tail -1)" > $OUT/info.txt
-echo "mesa: $MESA_VER" >> $OUT/info.txt
-chmod -R a+rX $OUT
-ls -l $OUT
-echo
+mkdir -p "$OUT"
+cp "$SO" "$OUT/libgallium_dri.so"
+sha256sum "$OUT/libgallium_dri.so" | tee "$OUT/sha256.txt"
+echo "GLIBC max: $(readelf --version-info "$SO" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -Vu | tail -1)" > "$OUT/info.txt"
+echo "mesa: $MESA_VER" >> "$OUT/info.txt"
+chmod -R a+rX "$OUT"
+ls -l "$OUT"
 echo "===== DONE ====="

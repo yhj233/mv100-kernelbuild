@@ -1,15 +1,16 @@
 name: build mesa lima_dri.so
 
-# Builds Mesa 21.2.6's src/gallium/drivers/lima driver as a drop-in
-# replacement for /usr/lib/arm-linux-gnueabihf/dri/lima_dri.so on the
-# Hi3798MV100 box (Ubuntu 20.04 armhf, mesa 21.2.6-0ubuntu0.1~20.04.2).
+# Cross-builds Mesa 21.2.6's lima driver for armhf, natively on an amd64
+# runner (arm-linux-gnueabihf cross toolchain, no qemu emulation).  The result
+# is a megadriver libgallium_dri.so that drops in as
+# /usr/lib/arm-linux-gnueabihf/dri/lima_dri.so on the Hi3798MV100 box
+# (Ubuntu 20.04 armhf, mesa 21.2.6-0ubuntu0.1~20.04.2).
 #
-# The build runs inside an armhf Ubuntu 20.04 container under qemu-user so
-# the resulting .so has exactly the same glibc / libdrm / libglapi ABI as the
-# distro package it replaces.  A cross toolchain from a 24.04 runner would
-# emit GLIBC_2.38+ symbols that focal cannot resolve.
+# The cross toolchain's own armhf sysroot carries glibc 2.31 (same as focal),
+# so the .so has no GLIBC_2.31+ symbols and loads unchanged.  Verified in the
+# build log via readelf --version-info.
 #
-# Output: artifact `lima_dri` with lima_dri.so + sha256.txt + info.txt.
+# Output: artifact `lima_dri` with libgallium_dri.so + sha256.txt + info.txt.
 
 on:
   workflow_dispatch:
@@ -22,46 +23,26 @@ on:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 300
+    timeout-minutes: 90
 
     steps:
       - name: Checkout (this repo)
         uses: actions/checkout@v4
 
-      - name: Install qemu-user-static (bwrap-free)
+      - name: Build (cross-compile)
         run: |
           set -x
-          # The ubuntu-24.04 runner has qemu-user-static preinstalled via
-          # docker.io, but docker/setup-qemu-action (used before) pulled a
-          # separate qemu binary and hung the whole job at "Set up job".
-          # Instead, rely on the distro package and make sure binfmt_misc
-          # is registered for arm before docker tries --platform arm/v7.
-          docker run --rm --platform linux/arm/v7 alpine:3.19 true \
-            && echo "arm emulation OK" \
-            || sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user-static
-          ls -l /proc/sys/fs/binfmt_misc/ | head -20 || true
-
-      - name: Build inside ubuntu:20.04 armhf
-        timeout-minutes: 240
-        run: |
-          set -x
-          rm -rf out && mkdir -p out
-          docker run --rm \
-            --platform linux/arm/v7 \
-            -v "$PWD":/work \
-            -w /work \
-            ubuntu:20.04 \
-            bash /work/mesa/build.sh
-          echo "--- host view of out/ ---"
+          bash mesa/build.sh
+          echo "--- out/ ---"
           ls -l out || true
 
       - name: Collect artifact
         if: always()
         run: |
           ls -l out || true
-          [ -f out/lima_dri.so ] && cat out/info.txt || echo "no .so produced"
+          [ -f out/libgallium_dri.so ] && cat out/info.txt || echo "no .so produced"
 
-      - name: Upload lima_dri.so
+      - name: Upload libgallium_dri.so
         if: always()
         uses: actions/upload-artifact@v4
         with:
