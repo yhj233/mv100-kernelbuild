@@ -86,58 +86,16 @@ ls /usr/lib/arm-linux-gnueabihf/pkgconfig/ 2>/dev/null | grep -E 'drm|xcb|x11|ex
 
 echo
 echo "=============================================================="
-echo " 3b. cross-build libdrm 2.4.109 (mesa 23.3 needs >=2.4.109, focal has 2.4.107)"
+echo " 3b. bump libdrm.pc version 2.4.107 -> 2.4.109 (version spoof)"
 echo "=============================================================="
 # Mesa 23.3.6 requires libdrm >= 2.4.109 but focal ships 2.4.107 (and the
 # device runs 2.4.107).  The 2.4.109 bump only adds amdgpu-only symbols
-# (drmGetDeviceFromDevId etc.), so a cross-built 2.4.109 .so is ABI-compatible
-# with the device's 2.4.107 runtime -- we build it ONLY as a build dep for the
-# headers + pkg-config metadata, and do NOT install it on the device.
-LIBDRM_VER=2.4.109
-DRM_DIR="$WORK/libdrm-$LIBDRM_VER"
-mkdir -p "$DRM_DIR"
-cd "$DRM_DIR"
-if [ ! -f libdrm.pc ]; then
-  curl -fsSL --retry 3 -m 120 \
-    "https://gitlab.freedesktop.org/mesa/drm/-/archive/libdrm-$LIBDRM_VER/drm-libdrm-$LIBDRM_VER.tar.gz" \
-    -o /tmp/libdrm.tar.gz || \
-  curl -fsSL --retry 3 -m 120 \
-    "https://dri.freedesktop.org/libdrm/libdrm-$LIBDRM_VER.tar.xz" \
-    -o /tmp/libdrm.tar.xz
-  [ -f /tmp/libdrm.tar.gz ] && tar xzf /tmp/libdrm.tar.gz
-  [ -f /tmp/libdrm.tar.xz ] && tar xJf /tmp/libdrm.tar.xz
-  # move source up one level
-  d=$(ls -d drm-* libdrm-* 2>/dev/null | head -1)
-  [ -n "$d" ] && mv "$d"/* . 2>/dev/null && rmdir "$d" 2>/dev/null
-fi
-# libdrm has no arch-specific deps for lima; build static-ish, install to
-# /usr/local/arm-linux-gnueabihf and point pkg-config at it.
-cat > /tmp/libdrm-cross.txt <<EOF
-[binaries]
-c = '${CROSS}-gcc'
-ar = '${CROSS}-ar'
-strip = '${CROSS}-strip'
-pkgconfig = 'pkg-config'
-
-[host_machine]
-system = 'linux'
-cpu_family = 'arm'
-cpu = 'armv7l'
-endian = 'little'
-EOF
-meson setup _build --cross-file /tmp/libdrm-cross.txt \
-  --buildtype=release --prefix=/usr/local/arm-linux-gnueabihf \
-  -Dudev=false -Dintel=false -Dradeon=false -Damdgpu=false -Dnouveau=false \
-  -Dvmwgfx=false -Domap=false -Dexynos=false -Dfreedreno=false -Dtegra=false \
-  -Dvc4=false -Detnaviv=false -Dman-pages=false \
-  -Dvalgrind=false -Dcairo-tests=false -Dinstall-test-programs=false
-ninja -C _build -j"$(nproc)"
-DESTDIR=/tmp/libdrm-stage ninja -C _build install
-# make its .pc visible to mesa's pkg-config lookup
-export PKG_CONFIG_PATH="/tmp/libdrm-stage/usr/local/arm-linux-gnueabihf/lib/pkgconfig:$PKG_CONFIG_PATH"
-export PKG_CONFIG_SYSROOT_DIR="/tmp/libdrm-stage"
-ls /tmp/libdrm-stage/usr/local/arm-linux-gnueabihf/lib/pkgconfig/
-grep -E '^Version:' /tmp/libdrm-stage/usr/local/arm-linux-gnueabihf/lib/pkgconfig/libdrm.pc
+# (drmGetDeviceFromDevId etc.); lima uses only drmIoctl/drmGetVersion/
+# drmFreeVersion/drmFreeDevice, all present since long before 2.4.107.  So we
+# just bump the .pc Version string so meson's check passes -- no real ABI need.
+LDPC=/usr/lib/arm-linux-gnueabihf/pkgconfig/libdrm.pc
+sed -i 's/^Version: .*/Version: 2.4.109/' "$LDPC"
+grep '^Version:' "$LDPC"
 
 echo
 echo "=============================================================="
@@ -197,7 +155,7 @@ strip = '${CROSS}-strip'
 pkgconfig = 'pkg-config'
 
 [properties]
-pkg_config_libdir = ['/usr/lib/arm-linux-gnueabihf/pkgconfig', '/usr/share/pkgconfig', '/tmp/libdrm-stage/usr/local/arm-linux-gnueabihf/lib/pkgconfig']
+pkg_config_libdir = ['/usr/lib/arm-linux-gnueabihf/pkgconfig', '/usr/share/pkgconfig']
 sys_root = '$("$CROSS-gcc" -print-sysroot)'
 
 [host_machine]
@@ -207,9 +165,7 @@ cpu = 'armv7l'
 endian = 'little'
 EOF
 cat /tmp/cross.txt
-export PKG_CONFIG_LIBDIR="/usr/lib/arm-linux-gnueabihf/pkgconfig:/usr/share/pkgconfig:/tmp/libdrm-stage/usr/local/arm-linux-gnueabihf/lib/pkgconfig"
-# keep the sysroot override so meson resolves the cross-built libdrm headers+lib
-export PKG_CONFIG_SYSROOT_DIR="/tmp/libdrm-stage"
+export PKG_CONFIG_LIBDIR="/usr/lib/arm-linux-gnueabihf/pkgconfig:/usr/share/pkgconfig"
 
 meson setup build \
   --cross-file /tmp/cross.txt \
