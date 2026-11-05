@@ -327,25 +327,6 @@ static int lima_init_pp_pipe(struct lima_device *dev)
 			pipe->processor[pipe->num_processor++] = pp;
 			if (!pipe->l2_cache[i >> 2])
 				pipe->l2_cache[pipe->num_l2_cache++] = l2_cache;
-
-			/*
-			 * EXPERIMENT: use a single PP core.
-			 *
-			 * On this Mali450 the driver reports two PP cores, but
-			 * every full-frame (DLBU) job wedges one of them: the
-			 * hardware raises PP_STATUS.RENDERING_ACTIVE together
-			 * with the undocumented bit 2 (the position PP_IRQ_HANG
-			 * occupies in INT_STATUS), never signals END_OF_FRAME,
-			 * and a hard reset cannot stop the bus afterwards.
-			 * PPINTSCAN/PP_INT_MASK do not help because HANG is not
-			 * in IRQ_MASK_USED, so the kernel sits out a full sched
-			 * timeout and the pipe is dead from then on.
-			 *
-			 * One PP is more than enough for a 1280x720 desktop on a
-			 * single Cortex-A7.  Remove this once the two-PP DLBU
-			 * path is understood.
-			 */
-			break;
 		}
 	}
 

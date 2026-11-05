@@ -18,16 +18,76 @@
 #define pp_write(reg, data) writel(data, ip->iomem + reg)
 #define pp_read(reg) readl(ip->iomem + reg)
 
+/*
+ * Upstream never listens for PP_IRQ_HANG: LIMA_PP_IRQ_MASK_ERROR does not
+ * contain it and LIMA_PP_IRQ_MASK_USED is built from END_OF_FRAME +
+ * MASK_ERROR, so the bit is masked in PP_INT_MASK.
+ *
+ * On Mali450 here the PP does raise HANG when it wedges (a DLBU job leaves
+ * one PP with RENDERING_ACTIVE and STATUS bit 2 set, no END_OF_FRAME ever),
+ * and because the interrupt is masked the kernel notices nothing: pipe->task
+ * stays above zero, the job waits out the full 10s scheduler timeout, and
+ * the hard reset that finally runs is the one that sprays
+ * INVALID_PLIST_COMMAND and leaves the core unusable.
+ *
+ * Unmasking HANG turns that into an immediate error interrupt, which gives
+ * us both a fast recovery attempt and -- more valuable right now -- a
+ * register dump taken while the PP is actually hung instead of ten seconds
+ * later.
+ */
+#define LIMA_PP_IRQ_MASK_ERROR_HANG \
+	(LIMA_PP_IRQ_MASK_ERROR | LIMA_PP_IRQ_HANG)
+
+#define LIMA_PP_IRQ_MASK_USED_HANG \
+	(LIMA_PP_IRQ_END_OF_FRAME | LIMA_PP_IRQ_MASK_ERROR_HANG)
+
+static void lima_pp_hang_dump(struct lima_ip *ip, u32 state)
+{
+	struct lima_device *dev = ip->dev;
+	struct lima_sched_pipe *pipe = dev->pipe + lima_pipe_pp;
+	const char *name = lima_ip_name(ip);
+
+	dev_err(dev->dev,
+		"%s HANG irq=%08x status=%08x ctrl=%08x buserr=%08x wbnd=%08x\n",
+		name, state, pp_read(LIMA_PP_STATUS), pp_read(LIMA_PP_CTRL),
+		pp_read(LIMA_PP_BUS_ERROR_STATUS),
+		pp_read(LIMA_PP_WRITE_BOUNDARY_LOW));
+	dev_err(dev->dev,
+		"%s HANG rendlist=%08x rawstat=%08x mask=%08x done=%08x task=%d\n",
+		name, pp_read(LIMA_PP_CURRENT_REND_LIST_ADDR),
+		pp_read(LIMA_PP_INT_RAWSTAT), pp_read(LIMA_PP_INT_MASK),
+		pipe->done, atomic_read(&pipe->task));
+
+	if (pipe->bcast_processor && pipe->current_task) {
+		struct drm_lima_m450_pp_frame *frame = pipe->current_task->frame;
+
+		dev_err(dev->dev,
+			"%s HANG job num_pp=%u dlbu=%u plbu=%08x/%08x stack=%08x/%08x\n",
+			name, frame->num_pp, frame->use_dlbu,
+			frame->plbu_array_address[0],
+			frame->plbu_array_address[1],
+			frame->fragment_stack_address[0],
+			frame->fragment_stack_address[1]);
+		dev_err(dev->dev,
+			"%s HANG dlbu_regs=%08x %08x %08x %08x\n",
+			name, frame->dlbu_regs[0], frame->dlbu_regs[1],
+			frame->dlbu_regs[2], frame->dlbu_regs[3]);
+	}
+}
+
 static void lima_pp_handle_irq(struct lima_ip *ip, u32 state)
 {
 	struct lima_device *dev = ip->dev;
 	struct lima_sched_pipe *pipe = dev->pipe + lima_pipe_pp;
 
-	if (state & LIMA_PP_IRQ_MASK_ERROR) {
+	if (state & LIMA_PP_IRQ_MASK_ERROR_HANG) {
 		u32 status = pp_read(LIMA_PP_STATUS);
 
 		dev_err(dev->dev, "%s error irq state=%x status=%x\n",
 			lima_ip_name(ip), state, status);
+
+		if (state & LIMA_PP_IRQ_HANG)
+			lima_pp_hang_dump(ip, state);
 
 		pipe->error = true;
 
@@ -214,7 +274,7 @@ static int lima_pp_soft_reset_async_wait_one(struct lima_ip *ip)
 	}
 
 	pp_write(LIMA_PP_INT_CLEAR, LIMA_PP_IRQ_MASK_ALL);
-	pp_write(LIMA_PP_INT_MASK, LIMA_PP_IRQ_MASK_USED);
+	pp_write(LIMA_PP_INT_MASK, LIMA_PP_IRQ_MASK_USED_HANG);
 	return 0;
 }
 
@@ -287,7 +347,7 @@ static int lima_pp_hard_reset(struct lima_ip *ip)
 
 	pp_write(LIMA_PP_PERF_CNT_0_LIMIT, 0);
 	pp_write(LIMA_PP_INT_CLEAR, LIMA_PP_IRQ_MASK_ALL);
-	pp_write(LIMA_PP_INT_MASK, LIMA_PP_IRQ_MASK_USED);
+	pp_write(LIMA_PP_INT_MASK, LIMA_PP_IRQ_MASK_USED_HANG);
 
 	/*
 	 * if there was an async soft reset queued,
