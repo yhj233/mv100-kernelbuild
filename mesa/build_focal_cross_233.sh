@@ -138,15 +138,12 @@ fi
 MAGIC=$(head -c 2 /tmp/libdrm.tar | od -An -tx1 | tr -d ' \n')
 echo "  libdrm archive magic: $MAGIC"
 case "$MAGIC" in
-  1f8b*)  echo "  -> gzip, extracting"; tar xzf /tmp/libdrm.tar || { echo "!! tar gz failed"; exit 1; } ;;
-  fd377a*) echo "  -> xz, extracting"; tar xJf /tmp/libdrm.tar || { echo "!! tar xz failed"; exit 1; } ;;
+  1f8b*)  echo "  -> gzip, extracting (strip top dir)"; tar xzf /tmp/libdrm.tar --strip-components=1 || { echo "!! tar gz failed"; exit 1; } ;;
+  fd377a*) echo "  -> xz, extracting (strip top dir)"; tar xJf /tmp/libdrm.tar --strip-components=1 || { echo "!! tar xz failed"; exit 1; } ;;
   *) echo "!! unknown archive type ($MAGIC)"; exit 1 ;;
 esac
-d=$(ls -d libdrm-* 2>/dev/null | head -1)
-echo "  extracted top dir: $d"
-[ -n "$d" ] && { mv "$d"/* . 2>/dev/null; rmdir "$d" 2>/dev/null; }
 echo "libdrm source root: $(pwd)"
-test -f meson.build && echo "meson.build present" || { echo "!! libdrm tree broken"; ls -la; exit 1; }
+test -f meson.build && echo "meson.build present" || { echo "!! libdrm tree broken"; ls -la | head -20; exit 1; }
 
 # Install libdrm directly INTO the cross toolchain's sysroot so its headers,
 # .so and libdrm.pc land exactly where the cross gcc + pkg-config already look.
