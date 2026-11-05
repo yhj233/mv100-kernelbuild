@@ -48,7 +48,14 @@ echo "cross glibc max: $(strings "$("$CROSS-gcc" -print-sysroot)/lib/arm-linux-g
 # armhf libraries Mesa links against.  dpkg --add-architecture lets apt pull the
 # :armhf .so/.pc side by side with the native amd64 ones.  armhf lives on
 # ports.ubuntu.com (not archive.ubuntu.com), so add a dedicated [arch=armhf] source.
+#
+# ALSO: the runner's default sources.list has archive/security.ubuntu.com entries
+# with NO arch qualifier.  Once armhf is added, `apt update` tries to fetch the
+# armhf Packages index from those amd64-only hosts -> 404 (this is exactly what
+# killed the earlier runs).  So we pin the existing entries to [arch=amd64] and let
+# only the ports.ubuntu.com entries below carry armhf.
 sudo dpkg --add-architecture armhf
+sudo sed -i -E 's#^deb (\[[^]]+\] )?(https?://(security|archive)\.ubuntu\.com/ubuntu)#deb [arch=amd64] \2#' /etc/apt/sources.list
 sudo tee /etc/apt/sources.list.d/armhf-ports.list >/dev/null <<'EOF'
 deb [arch=armhf] http://ports.ubuntu.com/ubuntu-ports jammy main universe
 deb [arch=armhf] http://ports.ubuntu.com/ubuntu-ports jammy-updates main universe
