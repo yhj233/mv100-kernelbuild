@@ -44,32 +44,47 @@ static irqreturn_t lima_pp_irq_handler(int irq, void *data)
 	struct lima_ip *ip = data;
 	struct lima_device *dev = ip->dev;
 	struct lima_sched_pipe *pipe = dev->pipe + lima_pipe_pp;
-	u32 state = pp_read(LIMA_PP_INT_STATUS);
+	u32 state;
 
-	/* for shared irq case */
+	/*
+	 * On M450 (pp_bcast present) lima_pp_bcast_irq_handler() walks every
+	 * PP and is the only consumer of their interrupt state.  It has to
+	 * own that job because it is the one keeping pipe->done per PP, and
+	 * because the two handlers race for the same END_OF_FRAME bit:
+	 *
+	 *   1. PP finishes and raises END_OF_FRAME on the shared IRQ line.
+	 *   2. This handler runs first (registered before pp_bcast), reads
+	 *      the state and clears it.
+	 *   3. The bcast handler then samples PP_STATUS while the PP has not
+	 *      yet dropped RENDERING_ACTIVE, sees no pending interrupt (step 2
+	 *      already cleared it) and skips the PP as "still rendering".
+	 *   4. The PP goes idle.  Nothing is left to raise the interrupt
+	 *      again, so the PP is never accounted in pipe->done, pipe->task
+	 *      never reaches zero and the job sits there for a full sched
+	 *      timeout with completely idle hardware -- and the hard reset
+	 *      that follows is what finally produces INVALID_PLIST_COMMAND.
+	 *
+	 * Leaving the interrupt untouched here removes the race: the bcast
+	 * handler reads PP_STATUS and PP_INT_STATUS back to back, so a
+	 * pending END_OF_FRAME always wins over a stale RENDERING_ACTIVE.
+	 *
+	 * The counting lives in the bcast handler for the same reason: letting
+	 * both handlers decrement made a two-PP job complete as soon as the
+	 * first PP finished, i.e. while the second was still reading its
+	 * polygon list.
+	 */
+	if (pipe->bcast_processor)
+		return IRQ_NONE;
+
+	state = pp_read(LIMA_PP_INT_STATUS);
+
 	if (!state)
 		return IRQ_NONE;
 
 	lima_pp_handle_irq(ip, state);
 
-	/*
-	 * On M450 (pp_bcast present) the completion interrupt of every PP is
-	 * delivered twice on the shared IRQ line: once to this per-PP handler
-	 * and once to lima_pp_bcast_irq_handler(), which also decrements
-	 * pipe->task.  Both used to decrement, so a two-PP job hit zero as soon
-	 * as the *first* PP finished.  The scheduler then signalled the fence
-	 * and submitted the next frame while the second PP was still reading
-	 * its polygon list -- which showed up as INVALID_PLIST_COMMAND and,
-	 * later, as a PP stuck in HANG.
-	 *
-	 * The bcast handler is the one that tracks pipe->done per PP and can
-	 * also detect completion by polling PP_STATUS, so it owns the counting
-	 * for M450.  This handler only acks the interrupt.
-	 */
-	if (!pipe->bcast_processor) {
-		if (atomic_dec_and_test(&pipe->task))
-			lima_sched_pipe_task_done(pipe);
-	}
+	if (atomic_dec_and_test(&pipe->task))
+		lima_sched_pipe_task_done(pipe);
 
 	return IRQ_HANDLED;
 }
@@ -192,9 +207,26 @@ static irqreturn_t lima_pp_bcast_irq_handler(int irq, void *data)
 	struct lima_sched_pipe *pipe = dev->pipe + lima_pipe_pp;
 	struct drm_lima_m450_pp_frame *frame;
 
-	/* for shared irq case */
-	if (!pipe->current_task)
-		return IRQ_NONE;
+	/*
+	 * No job to account interrupts to.  They still have to be acked,
+	 * because on M450 this is the only handler that clears them and a
+	 * stale END_OF_FRAME would keep the shared IRQ line asserted.
+	 */
+	if (!pipe->current_task) {
+		for (i = 0; i < pipe->num_processor; i++) {
+			struct lima_ip *ip = pipe->processor[i];
+			u32 state;
+
+			if (!ip || !ip->present)
+				continue;
+			state = pp_read(LIMA_PP_INT_STATUS);
+			if (state) {
+				pp_write(LIMA_PP_INT_CLEAR, state);
+				ret = IRQ_HANDLED;
+			}
+		}
+		return ret;
+	}
 
 	frame = pipe->current_task->frame;
 
@@ -202,7 +234,7 @@ static irqreturn_t lima_pp_bcast_irq_handler(int irq, void *data)
 		struct lima_ip *ip = pipe->processor[i];
 		u32 status, state;
 
-		if (pipe->done & (1 << i))
+		if (!ip || !ip->present)
 			continue;
 
 		/* status read first in case int state change in the middle
@@ -210,6 +242,18 @@ static irqreturn_t lima_pp_bcast_irq_handler(int irq, void *data)
 		 */
 		status = pp_read(LIMA_PP_STATUS);
 		state = pp_read(LIMA_PP_INT_STATUS);
+
+		/*
+		 * This handler is now the only one acking PP interrupts on
+		 * M450, so an interrupt that arrives after its PP was already
+		 * accounted still has to be cleared here -- otherwise the
+		 * shared IRQ line stays asserted forever.
+		 */
+		if (pipe->done & (1 << i)) {
+			if (state)
+				pp_write(LIMA_PP_INT_CLEAR, state);
+			continue;
+		}
 
 		if (state) {
 			lima_pp_handle_irq(ip, state);
