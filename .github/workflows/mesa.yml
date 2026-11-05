@@ -22,7 +22,9 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    # jammy (22.04) still ships armhf binary packages -- noble (24.04) dropped
+    # armhf, so `dpkg --add-architecture armhf` would 404 on noble's apt.
+    runs-on: ubuntu-22.04
     timeout-minutes: 90
 
     steps:
