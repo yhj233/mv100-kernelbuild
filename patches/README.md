@@ -171,7 +171,67 @@ disable 路径不会漏事件：`drm_crtc_vblank_off()` 会遍历 `vblank_event_
 **现在 `patches/drivers/gpu/drm/lima/lima_pp.c` 又回来了**，但内容完全不同：
 是"M450 上 `pipe->task` 被重复递减"的真正修复，见上面那一节。
 
-## lima_pp.c —— 修 M450 上 pipe->task 被重复递减（**真根因**）
+## lima_pp.c —— 真根因：per-PP handler 抢先把 END_OF_FRAME 清掉（**已修**）
+
+### 怎么找到的
+
+在 `lima_pp_bcast_irq_handler()` 的 `else` 分支（`state == 0` 且
+`RENDERING_ACTIVE`）里加现场 dump，把状态抓在**卡死那一刻**而不是 10 秒后。
+抓到的东西自相矛盾，而矛盾本身就是答案：
+
+```
+[stall] #0 pp=0 done=00000000 task=2 error=0
+[stall] gp  status=00000000 rawstat=00080000        <- GP 完全空闲
+[stall] pp0 status=00000040 rawstat=00000001 intstat=00000001 intmask=00000f19
+[stall] pp1 status=00000040 rawstat=00000001 intstat=00000001 intmask=00000f19
+[stall] dlbu fbdim=00010000 conf=20000000 tilepos=0000ffff enmask=00000003
+[stall] tllist: 全零
+```
+
+- 能进这个分支的前提是 handler 读到 `PP_STATUS` 的 bit0（`RENDERING_ACTIVE`），
+  可是 dump 里 `status = 0x40` —— **bit0 已经掉了**，PP 其实是空闲的
+- `rawstat = 0x1` = END_OF_FRAME 仍然 pending，而 `intmask = 0xf19` 没屏蔽它
+- 也就是说：**中断还在挂着，却被别人清过了**
+
+清它的就是先注册的 `lima_pp_irq_handler()`（pp0/pp1 各一个，注册顺序在
+pp_bcast 之前）。
+
+### 机制
+
+```
+1. PP 渲染完，拉 END_OF_FRAME，共享 IRQ35 触发
+2. lima_pp_irq_handler(pp0) 先跑：读到 state=1，lima_pp_handle_irq() 把
+   INT_CLEAR 写掉
+3. lima_pp_bcast_irq_handler() 接着跑：先读 status 仍是 ACTIVE（PP 还没掉位），
+   再读 state 已经是 0 → 走 else → 认定"还在渲染" → continue
+4. PP 随后自己掉 ACTIVE。END_OF_FRAME 已经被清，不会再产生中断
+5. 这个 PP 永远不写进 pipe->done，pipe->task 停在 2
+6. 干等 10s sched timeout → hard reset → PP 重新读到垃圾 plist →
+   才冒出 state=201 INVALID_PLIST_COMMAND
+```
+
+**所以 `INVALID_PLIST_COMMAND` 一直是"后果"不是"原因"**，这也解释了三件事：
+硬件全空闲却报超时、`error=0` 却走 timeout、以及为什么现象随机（取决于
+PP 掉 ACTIVE 与两次寄存器读之间的竞态）。
+
+### 修法
+
+M450 上**只让 bcast handler 消费 PP 中断**：
+
+- `lima_pp_irq_handler()` 在 `pipe->bcast_processor` 存在时直接 `IRQ_NONE`，
+  连 `INT_STATUS` 都不读。M400 没有 bcast，保持原样。
+- bcast handler 里 `PP_STATUS` 与 `PP_INT_STATUS` 背靠背读，pending 的
+  END_OF_FRAME 必然压过陈旧的 `RENDERING_ACTIVE`。
+- 因为现在是唯一清中断的人，两处补上 ack：
+  - PP 已在 `pipe->done` 里但迟到的中断 → 清掉，否则共享线一直拉着；
+  - `!pipe->current_task`（没有任务可记账）→ 遍历所有 PP 清掉残留。
+
+另外两处**必须保留**的既有修复：
+
+- 计数只在 bcast 里做（否则两 PP 任务在第一个完成时归零）；
+- `pipe->error` 为真时不再因 `RENDERING_ACTIVE` 而跳过（否则每个错误白等 10s）。
+
+## lima_pp.c —— 上一轮误判为根因的 bug：pipe->task 被重复递减（**真 bug，但不是根因**）
 
 ### 症状链（实测抓到的第一次失败）
 

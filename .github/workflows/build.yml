@@ -30,15 +30,43 @@ jobs:
             gcc-arm-linux-gnueabihf
           arm-linux-gnueabihf-gcc --version | head -1
 
-      - name: Clone kernel (histb branch, shallow)
+      # Until 2026-11-05 a plain shallow clone worked here.  It then started
+      # failing after ~0.4s with no git message at all (bash -e exits on the
+      # failing `git clone && break` list, so the loop never retried and the
+      # stderr text was lost).  Keep git clone as the first choice -- it gives
+      # the -g<hash> in the kernel release string -- but fall back to the
+      # codeload tarball, which is a single HTTPS GET and far more robust.
+      - name: Fetch kernel (histb branch)
         run: |
-          for i in 1 2 3; do
+          set +e
+          ok=0
+          for attempt in 1 2 3; do
+            echo "===== attempt $attempt ====="
+            echo "-- git ls-remote --"
+            git ls-remote --heads https://github.com/histb-mainline/linux.git 2>&1 | head -5
+            echo "-- git clone --"
             git clone --depth 1 -b histb \
-              https://github.com/histb-mainline/linux.git mv100-linux && break
-            echo "clone failed, retrying..."; rm -rf mv100-linux; sleep 10
+              https://github.com/histb-mainline/linux.git mv100-linux
+            rc=$?
+            echo "git clone rc=$rc"
+            if [ $rc -eq 0 ] && [ -f mv100-linux/Makefile ]; then ok=1; break; fi
+            rm -rf mv100-linux
+
+            echo "-- tarball fallback --"
+            curl -fL --retry 3 --retry-delay 5 -o /tmp/linux.tar.gz \
+              https://codeload.github.com/histb-mainline/linux/tar.gz/refs/heads/histb
+            rc=$?
+            echo "curl rc=$rc  size=$(stat -c %s /tmp/linux.tar.gz 2>/dev/null)"
+            if [ $rc -eq 0 ]; then
+              mkdir -p mv100-linux
+              tar -xzf /tmp/linux.tar.gz -C mv100-linux --strip-components=1
+              if [ -f mv100-linux/Makefile ]; then ok=1; break; fi
+            fi
+            rm -rf mv100-linux; sleep 10
           done
+          [ "$ok" = 1 ] || { echo "::error::no kernel source after 3 attempts"; exit 1; }
           test -f mv100-linux/Makefile
-          git -C mv100-linux log -1 --format='%h %ad %s'
+          git -C mv100-linux log -1 --format='%h %ad %s' 2>/dev/null || echo "(from tarball)"
 
       - name: Build
         run: |
