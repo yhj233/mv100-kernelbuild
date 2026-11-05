@@ -73,6 +73,9 @@ static irqreturn_t lima_pp_irq_handler(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+/* Diagnostic only: keep the "still active" spam bounded. */
+static int lima_pp_active_log;
+
 static irqreturn_t lima_pp_bcast_irq_handler(int irq, void *data)
 {
 	int i;
@@ -105,8 +108,23 @@ static irqreturn_t lima_pp_bcast_irq_handler(int irq, void *data)
 			lima_pp_handle_irq(ip, state);
 			ret = IRQ_HANDLED;
 		} else {
-			if (status & LIMA_PP_STATUS_RENDERING_ACTIVE)
+			if (status & LIMA_PP_STATUS_RENDERING_ACTIVE) {
+				/*
+				 * Diagnostic: the PP has no pending interrupt but
+				 * is still rendering, so it cannot be accounted as
+				 * done.  Seeing this means a PP is stuck active --
+				 * the scheduler will sit here until the timeout.
+				 */
+				if (lima_pp_active_log < 10) {
+					lima_pp_active_log++;
+					dev_err(dev->dev,
+						"[pp] %s still active rawstat=%08x status=%08x\n",
+						lima_ip_name(ip),
+						pp_read(LIMA_PP_INT_RAWSTAT),
+						status);
+				}
 				continue;
+			}
 		}
 
 		pipe->done |= (1 << i);

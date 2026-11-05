@@ -430,9 +430,9 @@ static void lima_hang_dump(struct lima_device *ldev,
 	 * hung" and "nobody told the scheduler the GPU finished".
 	 */
 	dev_err(ldev->dev,
-		"[hang] sched task_count=%d done=%08x num_processor=%d error=%d\n",
-		atomic_read(&pipe->task), pipe->done, pipe->num_processor,
-		pipe->error);
+		"[hang] sched jiffies=%lu task_count=%d done=%08x num_processor=%d error=%d\n",
+		jiffies, atomic_read(&pipe->task), pipe->done,
+		pipe->num_processor, pipe->error);
 
 	ip = ldev->ip + lima_ip_gp;
 	if (ip->present) {
@@ -671,6 +671,19 @@ void lima_sched_pipe_task_done(struct lima_sched_pipe *pipe)
 {
 	struct lima_sched_task *task = pipe->current_task;
 	struct lima_device *ldev = pipe->ldev;
+
+	/*
+	 * Diagnostic: an error job ends here and then relies on
+	 * drm_sched_fault() to run the timeout handler right away.  If the log
+	 * shows this line followed by the TDR only a full timeout later, the
+	 * immediate-fault path is not doing what we expect.
+	 */
+	if (pipe->error)
+		dev_err(ldev->dev,
+			"[done] pipe=%s jiffies=%lu task_count=%d done=%08x task=%px recov=%d\n",
+			lima_ip_name(pipe->processor[0]), jiffies,
+			atomic_read(&pipe->task), pipe->done, task,
+			task ? task->recoverable : -1);
 
 	if (pipe->error) {
 		if (task && task->recoverable)
