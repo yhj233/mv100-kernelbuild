@@ -21,11 +21,8 @@ echo "=============================================================="
 echo " 0. environment"
 echo "=============================================================="
 uname -m
-"$CROSS-gcc" --version | head -1
-echo "cross sysroot: $("$CROSS-gcc" -print-sysroot)"
-echo "cross glibc max: $(strings "$("$CROSS-gcc" -print-sysroot)/lib/arm-linux-gnueabihf/libc.so.6" 2>/dev/null | grep '^GLIBC_' | sort -V | tail -1)"
-dpkg --print-foreign-architectures
 nproc
+dpkg --print-foreign-architectures
 
 echo
 echo "=============================================================="
@@ -37,6 +34,10 @@ sudo apt-get install -y -qq --no-install-recommends \
   python3-mako python3-yaml bison flex \
   gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf \
   crossbuild-essential-armhf
+
+"$CROSS-gcc" --version | head -1
+echo "cross sysroot: $("$CROSS-gcc" -print-sysroot)"
+echo "cross glibc max: $(strings "$("$CROSS-gcc" -print-sysroot)/lib/arm-linux-gnueabihf/libc.so.6" 2>/dev/null | grep '^GLIBC_' | sort -V | tail -1)"
 
 # armhf libraries Mesa links against.  dpkg --add-architecture lets apt pull the
 # :armhf .so/.pc side by side with the native amd64 ones.
