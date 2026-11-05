@@ -81,26 +81,27 @@ CROSS_LIB="$("$CROSS-gcc" -print-file-name=libc.so.6 | xargs dirname)"
 echo "cross lib dir: $CROSS_LIB"
 mkdir -p "$FOCAL/backup"
 # glibc versioned ELF + their unversioned symlinks (libc.so.6 -> libc-2.31.so etc.)
+# NOTE: $CROSS_LIB is under /usr (root-owned) so all writes need sudo.
 for f in libc-2.31.so libm-2.31.so libpthread-2.31.so libdl-2.31.so librt-2.31.so \
          ld-2.31.so libc.so.6 libm.so.6 libpthread.so.0 libdl.so.2 librt.so.1 \
          ld-linux-armhf.so.3 libutil-2.31.so libutil.so.1 libresolv-2.31.so libresolv.so.2 \
-         libnsl-2.31.so libnsl.so.1 libcrypt.so.1 libanl-2.31.so libanl.so.1; do
+         libnsl-2.31.so libnsl.so.1 libanl-2.31.so libanl.so.1; do
   if [ ! -e "$FOCAL_LIB/$f" ]; then
     continue
   fi
   # back up the jammy version if present
   if [ -e "$CROSS_LIB/$f" ]; then
-    cp -a "$CROSS_LIB/$f" "$FOCAL/backup/" 2>/dev/null || true
-    rm -f "$CROSS_LIB/$f"
+    sudo cp -a "$CROSS_LIB/$f" "$FOCAL/backup/" 2>/dev/null || true
+    sudo rm -f "$CROSS_LIB/$f"
   fi
   # copy the focal file/symlink in (resolve to real content)
   if [ -L "$FOCAL_LIB/$f" ]; then
     # symlink: recreate it pointing at the focal versioned .so
     target="$(readlink "$FOCAL_LIB/$f")"
-    cp -a "$FOCAL_LIB/$target" "$CROSS_LIB/$target" 2>/dev/null || true
-    ln -sf "$target" "$CROSS_LIB/$f"
+    sudo cp -a "$FOCAL_LIB/$target" "$CROSS_LIB/$target" 2>/dev/null || true
+    sudo ln -sf "$target" "$CROSS_LIB/$f"
   else
-    cp -a "$FOCAL_LIB/$f" "$CROSS_LIB/$f"
+    sudo cp -a "$FOCAL_LIB/$f" "$CROSS_LIB/$f"
   fi
 done
 echo "--- cross libc now points at ---"
