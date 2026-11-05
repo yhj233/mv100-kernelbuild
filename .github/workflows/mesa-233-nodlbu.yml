@@ -1,0 +1,49 @@
+name: build mesa 23.3.6 lima_dri.so (DLBU disabled, focal cross)
+
+# A/B test: force-disable the Mali-450 DLBU path in lima_job.c so PPs use
+# static tile allocation.  If the periodic PP hang on Hi3798MV100 disappears,
+# the root cause is the DLBU unit; if it persists, DLBU is not the culprit.
+#
+# Same focal amd64 container + armhf cross toolchain as mesa-233-cross.yml,
+# but with the DLBU-disable patch applied at step 6.
+#
+# Output: artifact `lima_dri_233_nodlbu` with libgallium_dri.so + sha256 + info.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout (this repo)
+        uses: actions/checkout@v4
+
+      - name: Build (amd64 focal container, cross-compile armhf)
+        run: |
+          docker run --rm \
+            --platform linux/amd64 \
+            -v "$PWD":/work \
+            -w /work \
+            -e WORK=/work \
+            ubuntu:20.04 \
+            bash /work/mesa/build_focal_cross_233_nodlbu.sh
+          echo "--- out/ ---"
+          ls -l out || true
+
+      - name: Collect artifact
+        if: always()
+        run: |
+          ls -l out || true
+          [ -f out/libgallium_dri.so ] && cat out/info.txt || echo "no .so produced"
+
+      - name: Upload libgallium_dri.so
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lima_dri_233_nodlbu
+          path: out/*
+          if-no-files-found: warn
+          retention-days: 30
