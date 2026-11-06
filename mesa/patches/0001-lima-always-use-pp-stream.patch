@@ -16,19 +16,13 @@
 + * core cannot be bus-stopped afterwards.  The PP stream path never did
 + * that, not even with the same 3600-tile fullscreen workload.
 + *
-+ * Keep it behind LIMA_FORCE_PP_STREAM=1 so a single build can A/B test.
++ * Always force it (no env knob): DLBU is broken on this SoC, so disable it
++ * unconditionally.  This is the permanent fix, not an A/B toggle.
 + */
 +static bool
 +lima_force_pp_stream(void)
 +{
-+   static int force = -1;
-+
-+   if (force < 0) {
-+      const char *s = getenv("LIMA_FORCE_PP_STREAM");
-+      force = (s && *s && atoi(s) != 0) ? 1 : 0;
-+   }
-+
-+   return force == 1;
++   return true;
 +}
 +
  static void
