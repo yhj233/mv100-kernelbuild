@@ -1,6 +1,6 @@
 --- a/src/gallium/drivers/lima/lima_job.c
 +++ b/src/gallium/drivers/lima/lima_job.c
-@@ -728,6 +728,33 @@
+@@ -728,6 +728,27 @@
            dr->maxy == job->fb.height;
  }
  
@@ -28,7 +28,7 @@
  static void
  lima_update_pp_stream(struct lima_job *job)
  {
-@@ -735,7 +762,8 @@
+@@ -735,7 +756,8 @@
     struct lima_screen *screen = lima_screen(ctx->base.screen);
     struct lima_damage_region *damage = lima_job_get_damage(job);
     if ((screen->gpu_type == DRM_LIMA_PARAM_GPU_ID_MALI400) ||
