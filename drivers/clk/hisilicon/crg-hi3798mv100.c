@@ -453,6 +453,15 @@ static const struct hi3798_bits_clock hi3798mv100_bits_clks[] = {
 	{ HI3798MV100_HDMI_PHY_CLK, "clk_hdmi_phy", 0x110, BIT(0), BIT(0), },
 	/* CRG70[0] aiao_cken; the block resets through CRG70[4]. */
 	{ HI3798MV100_AIAO_CLK, "clk_aiao", 0x118, BIT(0), BIT(0), },
+	/*
+	 * CRG69[0] adac_cken. The on-chip TianLai DAC's analog stage does not
+	 * come up on a gate the bootloader merely left open: the vendor HAL
+	 * raises this bit, then pulses ADAC1.rst and CRG69[4] adac_srst_req
+	 * (hal_tianlai_adac_v500.c, Digfi_ADACEnable). The codec driver owns
+	 * the ADAC registers, so it has to own this gate as well, otherwise
+	 * the first disable by any other consumer leaves the outputs dead.
+	 */
+	{ HI3798MV100_ADAC_CLK, "clk_adac", 0x114, BIT(0), BIT(0), },
 };
 
 static int hi3798_clk_register_bits(struct device *dev,
