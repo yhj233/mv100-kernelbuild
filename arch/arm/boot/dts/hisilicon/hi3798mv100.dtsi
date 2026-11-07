@@ -100,20 +100,6 @@
 };
 
 &perictrl {
-	/*
-	 * The TianLai DAC sits in the PERI block at 0x110, not in its own
-	 * address window, so it is described as a child of perictrl and the
-	 * offsets below are relative to it. Only the two control registers
-	 * are needed; the audio it plays arrives over AIAO transmit port 2.
-	 */
-	adac: audio-codec@110 {
-		compatible = "hisilicon,hi3716cv200-adac";
-		reg = <0x110 0x8>;
-		clocks = <&crg HI3798MV100_ADAC_CLK>;
-		#sound-dai-cells = <0>;
-		status = "disabled";
-	};
-
 	usb2_phy1: usb2-phy@124 {
 		compatible = "hisilicon,hi3798mv100-usb2-phy";
 		reg = <0x124 0x4>;
