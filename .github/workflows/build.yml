@@ -11,6 +11,9 @@ on:
     paths:
       - 'build.sh'
       - '.github/workflows/build.yml'
+      # The patches are whole-file replacements injected by build.sh; a change
+      # there changes the kernel just as much as a change to build.sh does.
+      - 'patches/**'
 
 jobs:
   build:
