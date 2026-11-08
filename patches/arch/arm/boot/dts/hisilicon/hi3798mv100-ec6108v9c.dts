@@ -8,7 +8,15 @@
 #include "hi3798mv100.dtsi"
 
 / {
-	model = "Huawei EC6108V9C";
+	/*
+	 * The real board is a CM101S. It carries the same Hi3798MV100 SoC as
+	 * the EC6108V9C this file/compatible string is named after, but the
+	 * front-panel wiring is different -- which is why the historical LED
+	 * labels do not match the lamps (see the leds node below). The file
+	 * name and compatible are kept because the upstream tree only ships
+	 * this board dts and the build scripts key off its name.
+	 */
+	model = "CM101S (Hi3798MV100)";
 
 	compatible = "hisilicon,hi3798mv100-ec6108v9c",
 		     "hisilicon,hi3798mv100";
@@ -112,22 +120,48 @@
 	leds {
 		compatible = "gpio-leds";
 
+		/*
+		 * CM101S front panel, verified on 2026-11-08 by holding one
+		 * line high at a time and then by unplugging eth0: the carrier
+		 * watcher pulled GPIO5_2 low and it was the POWER lamp that
+		 * turned red. All three historical sysfs labels are wrong on
+		 * this board; they are kept so existing userspace paths work:
+		 *
+		 *   GPIO0_4  -> NETWORK lamp  (this "green:network" node)
+		 *   GPIO5_2  -> POWER   lamp  (this "green:ir" node, NOT IR)
+		 *   GPIO2_2  -> no visible lamp, kept low
+		 *
+		 * Both real lamps are bi-colour: high = green, low = red, so
+		 * brightness=0 means red rather than off. The vendor firmware
+		 * (_deploy/leds-green.sh) drives GPIO0_4 + GPIO5_2 high with
+		 * GPIO2_2 low for its "running green" state. There is no
+		 * SoC-controllable IR indicator on this board.
+		 */
 		network {
-			label = "green:network";
+			label = "green:network";	/* NETWORK lamp */
 			gpios = <&gpio0 4 GPIO_ACTIVE_HIGH>;
-			default-state = "off";
+			/*
+			 * Link-up green / link-down red, entirely in-kernel.
+			 * CONFIG_LEDS_TRIGGER_NETDEV=y and the DT binding in
+			 * ledtrig-netdev.c (linux,netdev-device) supply the
+			 * device name and link mode; no userspace watcher.
+			 */
+			linux,default-trigger = "netdev";
+			linux,netdev-device = "eth0";
+			default-state = "on";
 		};
 
-		network-activity {
-			label = "red:network";
-			gpios = <&gpio2 2 GPIO_ACTIVE_HIGH>;
-			default-state = "off";
-		};
-
-		ir {
-			label = "green:ir";
+		power {
+			label = "green:ir";		/* POWER lamp */
 			gpios = <&gpio5 2 GPIO_ACTIVE_HIGH>;
+			linux,default-trigger = "default-on";
+			default-state = "on";
 			panic-indicator;
+		};
+
+		unused {
+			label = "red:network";		/* no visible lamp found */
+			gpios = <&gpio2 2 GPIO_ACTIVE_HIGH>;
 			default-state = "off";
 		};
 	};
@@ -353,6 +387,12 @@
 
 &adac {
 	status = "okay";
+	/*
+	 * CRG69[4] adac_srst_req sits in the CRG syscon, outside the codec's
+	 * 8-byte register window. histb-adac.c pulses it through
+	 * syscon_regmap_lookup_by_phandle() at probe time.
+	 */
+	hisilicon,crg = <&crg>;
 };
 
 / {

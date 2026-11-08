@@ -35,6 +35,7 @@ REQUIRED_Y="ARCH_HISI COMMON_CLK_HI3798MV100 REGULATOR_HISI_STB HISI_FEMAC
 	DRM_SII9134 DRM_CLIENT_SELECTION DRM_FBDEV_EMULATION DRM_LIMA SOUND SND
 	SND_SOC SND_SOC_HDMI_CODEC SND_SOC_HISTB_AIAO_I2S SND_SOC_HISTB_AIAO_CARD
 	SND_SOC_HISTB_ADAC
+	LEDS_TRIGGER_NETDEV MFD_SYSCON
 	MEDIA_SUPPORT
 	VIDEO_DEV VIDEO_HISTB_VDEC VIDEO_HISTB_VENC VIDEO_HISTB_JPGD
 	CGROUP_SCHED CGROUP_FREEZER CGROUP_DEVICE CGROUP_PIDS FANOTIFY
@@ -133,6 +134,12 @@ do_config() {
 	"${cfg[@]}" -e MAC80211
 	"${cfg[@]}" -e RTL8XXXU
 	"${cfg[@]}" -e LEDS_CLASS
+	# Front-panel network lamp: link-up green / link-down red. The board dts
+	# sets linux,default-trigger="netdev" + linux,netdev-device="eth0";
+	# patches/drivers/leds/trigger/ledtrig-netdev.c parses the latter so
+	# userspace never has to write the device_name sysfs attribute.
+	"${cfg[@]}" -e LEDS_TRIGGER_NETDEV
+	"${cfg[@]}" -e MFD_SYSCON
 
 	# zram: compressed RAM swap.  1 GB of RAM with Firefox running means the
 	# disk swap on eMMC gets hit constantly; zram trades a few CPU cycles for
